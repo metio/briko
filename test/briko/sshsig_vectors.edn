@@ -1,0 +1,93 @@
+;; SPDX-FileCopyrightText: The briko Authors
+;; SPDX-License-Identifier: 0BSD
+
+;; Signatures made by OpenSSH_10.2p1 `ssh-keygen -Y sign -n briko-test`
+;; over :message from throwaway keys whose private halves were discarded,
+;; and ssh-keygen's own `-Y verify -I alice -n briko-test` verdict on the
+;; :alice signature under each allowed-signers line. The oracle tests
+;; re-check every recorded verdict against the ssh-keygen on the host.
+{:message "the bytes that were endorsed",
+ :namespace "briko-test",
+ :keys
+ {:alice
+  {:public
+   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM alice",
+   :fingerprint "SHA256:BxAs7lb3NMbdZCbaEZ/EyFGx9rU+WWCax7rdEYRMCU4"},
+  :mallory
+  {:public
+   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnbw5LNigNORRRvRAI7qYAKqZSAA3a/y+epQR1SyWZi mallory"},
+  :rsa
+  {:public
+   "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC4+1wdwXEB79eCG5o8p2IDoKoeXxrXiZIInwzGMrkg7LvVHCg3lZ3CI68n8UyTUDhOxqv135/7muumLV15E/0gJot89J0jXLla0Z3Q0nY1sL/6KvR77z+uMEKtXAAhR73DvO9pGKccmCh6q1urxFuUSv0V6QusFUxxQ4/6wpSdqp8HmiBfxvrJOsBjpM2BMP7j+TH3OyEBGN/5wSRJ+nGo84wKsA6OXx7ZlnRPYxG/Y7m/4PGEH3B2wTQDvY4jfZvMBRU45kzzNKrtuWtu8eRwDiWHdGuzq/NN3ymvwbMRtV+DZHXyYh53IrRXx6WCtkRjOKs4VifWkDGGa6ZXerxV rsa"},
+  :ecdsa
+  {:public
+   "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNLUnZLF04K65whJ7a8iVMuFWQWmg9Zpmswli/V14rZKdzYl71f2ybFg3Mv6MAt3eIcR7CYSi+Wibdgz6mGjph4= ecdsa"}},
+ :signatures
+ {:alice
+  "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgtf/tgZQcv/oh6I6Qc1F2werAJE\nV2H1Nl4FECh37k4MwAAAAKYnJpa28tdGVzdAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gt\nZWQyNTUxOQAAAECe56zoOVVauze541WX1aT3Q4uhmNy/efW+pKqK9FNPpW+LBrAVOlvh3z\nrXCbDEvZN/JjrxXjQqCZ3/awmQdQUM\n-----END SSH SIGNATURE-----\n",
+  :alice-other-namespace
+  "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgtf/tgZQcv/oh6I6Qc1F2werAJE\nV2H1Nl4FECh37k4MwAAAANb3RoZXItcHVycG9zZQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtz\nc2gtZWQyNTUxOQAAAED49NgFmL1WfSnOfR+7Vbsecp9bv5jQkUgNRBffU557JOV4JXGbEP\n/AAlm5NX8YXDX5khHNk6ZxQ4eb/cHOMzgF\n-----END SSH SIGNATURE-----\n",
+  :mallory
+  "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgCdvDks2KA05FFG9EAjupgAqplI\nADdr/L56lBHVLJZmIAAAAKYnJpa28tdGVzdAAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gt\nZWQyNTUxOQAAAECsU95Q0ug1wG04fwn8KtmhE0jiclrVRaX8DyHPI1gPYeDwezyWwiaF6o\nmyYAM55QD4RmM70frSYO0cNKX2gkAJ\n-----END SSH SIGNATURE-----\n",
+  :rsa
+  "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAARcAAAAHc3NoLXJzYQAAAAMBAAEAAAEBALj7XB3BcQHv14IbmjynYg\nOgqh5fGteJkgifDMYyuSDsu9UcKDeVncIjryfxTJNQOE7Gq/Xfn/ua66YtXXkT/SAmi3z0\nnSNcuVrRndDSdjWwv/oq9HvvP64wQq1cACFHvcO872kYpxyYKHqrW6vEW5RK/RXpC6wVTH\nFDj/rClJ2qnweaIF/G+sk6wGOkzYEw/uP5Mfc7IQEY3/nBJEn6cajzjAqwDo5fHtmWdE9j\nEb9jub/g8YQfcHbBNAO9jiN9m8wFFTjmTPM0qu25a27x5HAOJYd0a7Or803fKa/BsxG1X4\nNkdfJiHncitFfHpYK2RGM4qzhWJ9aQMYZrpld6vFUAAAAKYnJpa28tdGVzdAAAAAAAAAAG\nc2hhNTEyAAABFAAAAAxyc2Etc2hhMi01MTIAAAEAGBps00YkcGE/STHC0Mdf8DxPGWUPHJ\nQ8PqG6wwzIcYM8uofpcxIAs9FFtMso2eoTRESYCZKkXc/6xP7CUxOVTWkF59tlfyJ6be4T\nr/Y2DWdg4n+z99QUDuYYKZNY0QwsNykbJub1og4aHR5bMNOnvDZyA7Bc/ltqYIqY/rV/+P\nQywfxJq5B1Hon3adK1qVC7GsihPzhEmGGkQo6vxzkMdKcKhDzfCNJavIPSSwoxlZgTiltl\nB50LXPlo0NOnGq5HOoNDPoqXrBIIVp4ujyL81ZGsuOvN6hAh36qOBv2CEEmKAQcjq/yIL8\ncMg/d6osbKu9Fhd66ri8G8HKCOYTCQPQ==\n-----END SSH SIGNATURE-----\n",
+  :ecdsa
+  "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAE\nEE0tSdksXTgrrnCEntryJUy4VZBaaD1mmazCWL9XXitkp3NiXvV/bJsWDcy/owC3d4hxHs\nJhKL5aJt2DPqYaOmHgAAAApicmlrby10ZXN0AAAAAAAAAAZzaGE1MTIAAABlAAAAE2VjZH\nNhLXNoYTItbmlzdHAyNTYAAABKAAAAIQCcxoW1j5yi9RbWLs9fZ0VTx7KwLYKml6nuwSE7\n8zav1gAAACEAj3CGYzPuDXCWBx7Aobxlv2grcbdMFMR7ATpjM4G/LDE=\n-----END SSH SIGNATURE-----\n"},
+ :signer-lines
+ [{:line
+   "alice ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen true}
+  {:line
+   "alice namespaces=\"briko-*\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen true}
+  {:line
+   "alice namespaces=\"!briko-test,briko-*\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice namespaces=\"briko-?est\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen true}
+  {:line
+   "alice namespaces=\"briko-?\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice namespaces=\"other\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM namespaces=\"*\"",
+   :ssh-keygen false}
+  {:line
+   "alice cert-authority ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice cert-authority,namespaces=\"briko-*\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice valid-before=\"20200101\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice valid-after=\"20200101\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen true}
+  {:line
+   "alice valid-before=\"29990101\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen true}
+  {:line
+   "alice no-such-option ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice =\"x\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice namespaces=\"briko-*\",= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "alice ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM trailing comment",
+   :ssh-keygen true}
+  {:line
+   "mallory ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen false}
+  {:line
+   "*,alice ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen true}
+  {:line
+   "bob,alice ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILX/7YGUHL/6IeiOkHNRdsHqwCRFdh9TZeBRAod+5ODM",
+   :ssh-keygen true}]}

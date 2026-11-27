@@ -6,4 +6,5 @@
  :lint-as {clojure.test.check.clojure-test/defspec clojure.core/def
            ;; (with-temp-dir [dir] body) binds dir like a fn parameter
            briko.process-test/with-temp-dir clojure.core/fn
-           briko.secret-test/with-temp-dir clojure.core/fn}}
+           briko.secret-test/with-temp-dir clojure.core/fn
+           briko.ssh-sign-test/with-temp-dir clojure.core/fn}}
