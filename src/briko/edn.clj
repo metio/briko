@@ -14,8 +14,9 @@
        deeper than :max-depth, so a deep form never reaches the recursive
        reader, whose StackOverflowError a `catch Exception` would miss.
        Collections count one level each, and so do the prefixes the reader
-       also recurses on: tagged literals, metadata and discards. A
-       namespaced map counts two, its prefix and its map;
+       also recurses on: tagged literals, symbolic values (##Inf),
+       metadata and discards. A namespaced map counts two, its prefix and
+       its map;
      - a number literal is at most :max-number-chars long, because parsing
        a long integer literal takes time quadratic in its length;
      - a tagged literal is read only when :readers names its tag, #inst
@@ -142,13 +143,17 @@
 ;; prefix the reader handles by reading further forms inside the same call:
 ;;
 ;;   #tag x    one form, and the tagged literal is a form itself
+;;   ##x       one form (##Inf), and the symbolic value is a form itself
 ;;   #_ x      one form, and the discard yields no form
 ;;   ^m x      two forms (the metadata, then the value); also #^m x
 ;;   #:ns {}   two forms (the namespace symbol, then the map), and the
 ;;             map is a collection of its own, so it counts two levels
+;;
+;; These are every prefix in EdnReader's dispatch table (^ { < _ : #) and
+;; its macro table; #< is refused outright and reads nothing after it.
 
 (def ^:private collection 1)
-(def ^:private tag 2)
+(def ^:private form-prefix 2) ; #tag and ##: completing x completes a form
 (def ^:private discard 3)
 (def ^:private two-forms 4)
 (def ^:private one-form 5)
@@ -238,7 +243,7 @@
                       (when (pos? d)
                         (let [top (aget stack (dec d))]
                           (cond
-                            (= top tag) (do (vreset! depth (dec d)) (recur))
+                            (= top form-prefix) (do (vreset! depth (dec d)) (recur))
                             (= top discard) (vreset! depth (dec d))
                             (= top two-forms) (aset stack (dec d) (int one-form))
                             (= top one-form) (do (vreset! depth (dec d)) (recur))
@@ -285,7 +290,7 @@
                   (= d \{) (do (push! collection) (recur (+ i 2)))
                   (= d \_) (do (push! discard) (recur (+ i 2)))
                   (or (= d \^) (= d \:)) (do (push! two-forms) (recur (+ i 2)))
-                  (= d \#) (recur (long (atom! (+ i 2))))
+                  (= d \#) (do (push! form-prefix) (recur (+ i 2)))
                   (Character/isLetter d)
                   (let [end (token-end s (inc i))
                         t (symbol (subs s (inc i) end))]
@@ -293,7 +298,7 @@
                       (refuse! ::tag-refused (str "the input holds the tagged literal #" t
                                                   ", and no reader is given for it")
                                {:tag t}))
-                    (push! tag)
+                    (push! form-prefix)
                     (recur end))
                   ;; The reader refuses any other dispatch character here
                   ;; and reads nothing after it.

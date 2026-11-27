@@ -47,11 +47,13 @@
 
 (defn- depth
   "How deep x nests collections, a map's keys and values one level below
-   the map."
+   the map. An infinite double prints as ##Inf or ##-Inf, whose ## the
+   reader recurses through, so it counts one level."
   [x]
-  (if (coll? x)
-    (inc (reduce max 0 (map depth (if (map? x) (mapcat identity x) x))))
-    0))
+  (cond
+    (coll? x) (inc (reduce max 0 (map depth (if (map? x) (mapcat identity x) x))))
+    (and (double? x) (Double/isInfinite x)) 1
+    :else 0))
 
 (deftest printed-data-reads-back-equal
   (holds? 300
@@ -71,8 +73,8 @@
 
 ;; Text built from prefixes as well as collections, with the number of
 ;; levels clojure.edn recurses through to read it: one per collection, per
-;; tagged literal, per discard and per metadata prefix, and two per
-;; namespaced map (the prefix and its map). The property checks the scan
+;; tagged literal, per symbolic value, per discard and per metadata prefix,
+;; and two per namespaced map (the prefix and its map). The property checks the scan
 ;; against this model of the reader.
 (def ^:private syntax
   (gen/recursive-gen
@@ -92,7 +94,8 @@
        (gen/fmap (fn [xs] [(str "#:ns{" (str/join " " (map-indexed (fn [i [t _]] (str ":k" i " " t)) xs)) "}")
                            (+ 2 (reduce max 0 (map second xs)))])
                  (gen/vector inner 0 3))]))
-   (gen/elements [["1" 0] [":k" 0] ["\"[{(\"" 0] ["\\[" 0] ["sym" 0] ["nil" 0]])))
+   (gen/elements [["1" 0] [":k" 0] ["\"[{(\"" 0] ["\\[" 0] ["sym" 0] ["nil" 0]
+                  ["##Inf" 1] ["## -Inf" 1] ["\"##\"" 0] ["\\#" 0]])))
 
 (deftest text-reads-exactly-when-its-levels-are-within-the-limit
   (holds? 500
@@ -103,6 +106,21 @@
                            :read
                            (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))]
               (= result (if (<= levels limit) :read ::edn/too-deep))))))
+
+(deftest symbolic-value-chains-are-refused-as-too-deep-exactly-beyond-the-limit
+  ;; ## reads the form after it, so k of them before any text add k
+  ;; levels; the reader then refuses every such chain, because the form
+  ;; after ## is not one of the symbols Inf, -Inf or NaN.
+  (holds? 500
+          (prop/for-all [[text levels] syntax
+                         k (gen/choose 1 6)
+                         limit (gen/choose 1 10)]
+            (let [result (try
+                           (edn/read-string (str (str/join (repeat k "## ")) text)
+                                            {:max-depth limit :readers {'t identity}})
+                           :read
+                           (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))]
+              (= result (if (<= (+ k levels) limit) ::edn/malformed ::edn/too-deep))))))
 
 (defn- outcome
   "What reading does: :read, the :type of a refusal, or the class of
