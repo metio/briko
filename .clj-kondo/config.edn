@@ -3,4 +3,7 @@
 
 {;; defspec defines a test var; without this kondo flags every property
  ;; test name as unresolved
- :lint-as {clojure.test.check.clojure-test/defspec clojure.core/def}}
+ :lint-as {clojure.test.check.clojure-test/defspec clojure.core/def
+           ;; (with-temp-dir [dir] body) binds dir like a fn parameter
+           briko.process-test/with-temp-dir clojure.core/fn
+           briko.secret-test/with-temp-dir clojure.core/fn}}

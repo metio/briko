@@ -41,6 +41,26 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (edn/read-string text {:readers {'inst #(java.time.Instant/parse %)}})
 ```
 
+- `briko.process` runs a program as an argv, never through a shell, within a deadline (60 s by default) and with stdout and stderr captured up to a byte limit (1 MiB and 64 KiB). It never throws for a program that cannot be started (exit 127) or that overruns its deadline (exit 124, after its process tree was killed).
+
+```clojure
+(require '[briko.process :as process])
+
+(process/run ["git" "status" "--porcelain"] {:dir repo :timeout-ms 10000 :unset-env ["GIT_DIR"]})
+;; => {:exit 0 :out "..." :err "" :timed-out? false :launched? true
+;;     :out-truncated? false :err-truncated? false}
+```
+
+- `briko.secret` resolves secrets named in configuration at the moment of use: `{:env "NAME"}`, `{:file "/path"}`, `{:credential "NAME"}` (systemd credentials) and `{:command ["pass" "show" "x"]}`. An unset variable, a missing file, an empty or blank value and a command that fails or overruns its deadline are refused; no refusal carries the secret or the command's output.
+
+```clojure
+(require '[briko.secret :as secret])
+
+(secret/resolve-secrets nil {:url "https://example.org/hook"
+                             :headers {"Authorization" {:command ["pasejo" "secret" "show" "--line" "1" "api/x"]}}})
+(secret/materialize-file "ssh key" {:credential "signing-key"} private-dir "signing-key")
+```
+
 ## Development
 
 The toolchain comes from [breto](https://github.com/metio/breto): run `eval "$(breto env)"` in the checkout, then
