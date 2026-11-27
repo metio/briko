@@ -108,6 +108,36 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 ;; => {:verdict :verified :actor "alice" :namespace "demo-skill-manifest"}
 ```
 
+- `briko.paths` names where a program keeps its files: the XDG base directories, ignoring a variable that is empty, blank or relative as the specification asks; the home directory (`$HOME` when absolute, else the `user.home` property, else a refusal); `expand-home` for `~` and `~/…`; and `load-edn-config`, which reads one map through `briko.edn` and merges it over defaults.
+
+```clojure
+(require '[briko.paths :as paths])
+
+(paths/config-home)                      ;; => "/home/me/.config"
+(paths/load-edn-config (str (paths/config-home) "/tool/config.edn")
+                       {:store "~/.local/share/tool" :keep 3}
+                       {:home-paths [[:store]] :edn {:max-bytes 65536}})
+```
+
+- `briko.fs` writes files safely. `atomic-write!` stages the content in a uniquely named file beside the target, forces it to disk and renames it into place, so a reader sees the old content or the new and two writers never mix; it refuses rather than falls back when the file system cannot rename atomically. `write-private!` and `create-private-directory!` create a file `rw-------` or a directory `rwx------` in the same call that creates it, refuse whatever already exists at the path, a symbolic link included, and refuse a file system that cannot keep the permissions.
+
+```clojure
+(require '[briko.fs :as bfs])
+
+(bfs/atomic-write! "state/inventory.edn" (pr-str inventory))
+(bfs/atomic-write! "cache/index" bytes {:fsync? false})
+(bfs/write-private! (str dir "/token") token)
+```
+
+- `briko.digest` computes SHA-256 of bytes, text (UTF-8), streams and files, the last two in bounded memory, and prints digests as lowercase hex without a prefix; a format that writes `sha256-` or `sha256:` adds its own.
+
+```clojure
+(require '[briko.digest :as digest])
+
+(digest/sha256-hex "abc")              ;; => "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+(str "sha256-" (digest/sha256-hex-file "archive.tar.gz"))
+```
+
 ## Cryptography
 
 briko implements no cryptographic primitive. Hashes and signature checks are the JDK's (`java.security`: SHA-256, SHA-512, Ed25519), and signing is OpenSSH's (`ssh-keygen`), so briko never reads a private key. What briko implements itself is the parsing of the SSHSIG wire format and of allowed-signers lines, and the assembly of the bytes a signature covers. Its tests check those verdicts against `ssh-keygen` on signatures `ssh-keygen` made.
