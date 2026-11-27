@@ -61,6 +61,29 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (secret/materialize-file "ssh key" {:credential "signing-key"} private-dir "signing-key")
 ```
 
+- `briko.sshsig` verifies OpenSSH detached signatures (the SSHSIG format of `ssh-keygen -Y sign`) in process, against allowed-signers text, for `ssh-ed25519` keys and Ed25519 security keys. A security-key signature counts only when the key reports a touch. Other key types, unknown hashes and allowed-signers lines with `valid-before`/`valid-after` are answered `:briko.sshsig/unsupported` instead of false.
+
+```clojure
+(require '[briko.sshsig :as sshsig])
+
+(sshsig/verify allowed-signers-text message-bytes armored-signature "alice" "my-app-event")
+;; => true, false or :briko.sshsig/unsupported
+```
+
+- `briko.ssh-sign` signs bytes through `ssh-keygen -Y sign` and verifies them: in process through `briko.sshsig` where it can, through `ssh-keygen -Y verify` for the key types it cannot judge. A verdict is true, false, or nil when neither could judge. The signing namespace is always an explicit argument.
+
+```clojure
+(require '[briko.ssh-sign :as ssh-sign])
+
+(def sig (ssh-sign/sign-bytes "/path/to/key" message-bytes "my-app-event"))
+(ssh-sign/verify-bytes "/path/to/allowed_signers" message-bytes sig "alice" "my-app-event")
+(ssh-sign/fingerprint (ssh-sign/pubkey "/path/to/key"))  ;; => "SHA256:..."
+```
+
+## Cryptography
+
+briko implements no cryptographic primitive. Hashes and signature checks are the JDK's (`java.security`: SHA-256, SHA-512, Ed25519), and signing is OpenSSH's (`ssh-keygen`), so briko never reads a private key. What briko implements itself is the parsing of the SSHSIG wire format and of allowed-signers lines, and the assembly of the bytes a signature covers. Its tests check those verdicts against `ssh-keygen` on signatures `ssh-keygen` made.
+
 ## Development
 
 The toolchain comes from [breto](https://github.com/metio/breto): run `eval "$(breto env)"` in the checkout, then
