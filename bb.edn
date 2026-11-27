@@ -18,7 +18,7 @@
                      (shell "clojure -M:splint"))}
   fmt {:doc "Check formatting (cljfmt); `bb fmt fix` rewrites"
        :task (shell (str "clojure -M:cljfmt " (or (first *command-line-args*) "check")))}
-  reflection {:doc "Load every namespace under src on the JVM and fail on a reflection warning"
+  reflection {:doc "Load every namespace under src on the JVM and fail on any compiler warning"
               :task (shell "clojure -M:dev -m briko.reflection-check src")}
   vuln {:doc "Dependency CVE scan (clj-watson; needs GITHUB_TOKEN)"
         :task (shell "clojure -M:watson -p deps.edn -t github-advisory")}}}

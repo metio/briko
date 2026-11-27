@@ -32,6 +32,21 @@ jobs:
         with:
           registries: github:metio/toolchains
       - run: bb test:bb
+  reflection:
+    # Every namespace runs in GraalVM native images, where a reflective call
+    # fails at run time, so loading the sources must print no compiler
+    # warning.
+    name: Reflection
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: metio/ci/breto@4ffe6343c7dad75502de503165b853f1959afc8c # 2026.11.21090200
+        with:
+          registries: github:metio/toolchains
+      - run: bb reflection
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -48,7 +63,7 @@ jobs:
   verify:
     # The single required check: new jobs only need to be listed here.
     name: Verify
-    needs: [clojure, babashka, lint]
+    needs: [clojure, babashka, reflection, lint]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
