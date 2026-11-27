@@ -187,7 +187,46 @@
     (testing "namespaced maps"
       (is (= #:a{:b #:c{:d 1}} (edn/read-string "#:a{:b #:c{:d 1}}" {:max-depth 4})))
       (is (= ::edn/too-deep (refused "#:a{:b #:c{:d 1}}" {:max-depth 3})))
-      (is (= {} (edn/read-string "#: a{}" {:max-depth 2}))))))
+      (is (= {} (edn/read-string "#: a{}" {:max-depth 2}))))
+    (testing "symbolic values"
+      (is (= ##Inf (edn/read-string "##Inf" {:max-depth 1})))
+      (is (= ##-Inf (edn/read-string "## -Inf" {:max-depth 1})))
+      (is (= [##Inf] (edn/read-string "[##Inf]" {:max-depth 2})))
+      (is (= ::edn/too-deep (refused "[##Inf]" {:max-depth 1})))
+      (is (= [##Inf ##-Inf] (edn/read-string "[##Inf ##-Inf]" {:max-depth 2})))
+      (is (= ::edn/malformed (refused (str (str/join (repeat 8 "## ")) "Inf") {:max-depth 8})))
+      (is (= ::edn/too-deep (refused (str (str/join (repeat 9 "## ")) "Inf") {:max-depth 8}))))
+    (testing "symbolic values mixed with other prefixes"
+      (is (= ##Inf (edn/read-string "#t ##Inf" {:max-depth 2 :readers readers})))
+      (is (= ::edn/too-deep (refused "#t ##Inf" {:max-depth 1 :readers readers})))
+      (is (= [1] (edn/read-string "[#_ ##Inf 1]" {:max-depth 3})))
+      (is (= ::edn/too-deep (refused "[#_ ##Inf 1]" {:max-depth 2})))
+      (is (= ::edn/malformed (refused "#t ## #t ## [##Inf]" {:max-depth 6 :readers readers})))
+      (is (= ::edn/too-deep (refused "#t ## #t ## [##Inf]" {:max-depth 5 :readers readers})))
+      (is (= ::edn/malformed (refused "^:m ## ^:m ## [1]" {:max-depth 5})))
+      (is (= ::edn/too-deep (refused "^:m ## ^:m ## [1]" {:max-depth 4})))
+      (is (= ::edn/malformed (refused "#:a{:b ## #:c{:d ##Inf}}" {:max-depth 6})))
+      (is (= ::edn/too-deep (refused "#:a{:b ## #:c{:d ##Inf}}" {:max-depth 5}))))))
+
+(defn- scan-refusal
+  "The :type the depth scan alone refuses s with, or :no-refusal, so a
+   test can tell the scan from the reader's StackOverflowError backstop."
+  [s opts]
+  (refusal #(#'edn/scan! s (merge edn/defaults opts))))
+
+(deftest the-scan-alone-refuses-symbolic-value-chains
+  (doseq [text [(str (str/join (repeat 200000 "## ")) "Inf")
+                (str (str/join (repeat 200000 "##")) "Inf")
+                (str (str/join (repeat 100000 "#t ## ")) "Inf")
+                (str (str/join (repeat 100000 "## [")) "1")]]
+    (is (= ::edn/too-deep (scan-refusal text {:max-depth 100000 :readers {'t identity}}))
+        (subs text 0 8))
+    (is (= ::edn/too-deep (scan-refusal text {:readers {'t identity}}))
+        (subs text 0 8))
+    (is (= ::edn/too-deep (refused text {:max-bytes 2000000 :readers {'t identity}}))
+        (subs text 0 8)))
+  (is (= ::edn/too-deep (scan-refusal (str (str/join (repeat 65 "## ")) "Inf") {})))
+  (is (= :no-refusal (scan-refusal (str (str/join (repeat 64 "## ")) "Inf") {}))))
 
 (deftest deep-input-is-refused-before-the-reader-overflows
   ;; clojure.edn throws StackOverflowError on this input on the JVM and
@@ -224,7 +263,11 @@
     (testing "a comment character inside a string is not a comment"
       (is (= ::edn/too-deep (refused "[\";\" [1]]" opts))))
     (testing "a quote inside a comment opens no string"
-      (is (= ::edn/too-deep (refused "[; \"\n[1] \"]" opts))))))
+      (is (= ::edn/too-deep (refused "[; \"\n[1] \"]" opts))))
+    (testing "a symbolic value inside a string, comment or character does not count"
+      (is (= ["## ## ##"] (edn/read-string "[\"## ## ##\"]" opts)))
+      (is (= [1] (edn/read-string "[1 ; ## ## ## ##\n]" opts)))
+      (is (= [\# \# 1] (edn/read-string "[\\# \\# 1]" opts))))))
 
 (deftest unmatched-closers-do-not-lower-the-count
   (is (= ::edn/malformed (refused (str "]]]]]]" (nest 3 "[" "]" "")) {:max-depth 3})))
