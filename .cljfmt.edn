@@ -1,0 +1,5 @@
+;; SPDX-FileCopyrightText: The briko Authors
+;; SPDX-License-Identifier: 0BSD
+
+{:extra-indents {defspec [[:inner 0]]
+                 for-all [[:block 1]]}}

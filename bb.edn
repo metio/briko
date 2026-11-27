@@ -1,0 +1,24 @@
+;; SPDX-FileCopyrightText: The briko Authors
+;; SPDX-License-Identifier: 0BSD
+
+{:paths ["src"]
+ :tasks
+ {test {:doc "Run the test suite under the JVM and under babashka"
+        :depends [test:jvm test:bb]}
+  test:jvm {:doc "Run the test suite on the JVM (kaocha); arguments go to kaocha"
+            :task (apply shell "clojure -M:test" *command-line-args*)}
+  test:bb {:doc "Run the test suite under babashka; arguments name namespaces to run"
+           :extra-paths ["test"]
+           :requires ([briko.test-runner :as runner])
+           :task (runner/run "test" *command-line-args*)}
+  lint {:doc "clj-kondo over the code base, failing on warnings as CI does"
+        :task (shell "clj-kondo --fail-level warning --lint src test")}
+  analyze {:doc "Deep static analysis (eastwood, splint)"
+           :task (do (shell "clojure -M:eastwood")
+                     (shell "clojure -M:splint"))}
+  fmt {:doc "Check formatting (cljfmt); `bb fmt fix` rewrites"
+       :task (shell (str "clojure -M:cljfmt " (or (first *command-line-args*) "check")))}
+  reflection {:doc "Load every namespace under src on the JVM and fail on a reflection warning"
+              :task (shell "clojure -M:dev -m briko.reflection-check src")}
+  vuln {:doc "Dependency CVE scan (clj-watson; needs GITHUB_TOKEN)"
+        :task (shell "clojure -M:watson -p deps.edn -t github-advisory")}}}

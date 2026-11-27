@@ -1,0 +1,6 @@
+;; SPDX-FileCopyrightText: The briko Authors
+;; SPDX-License-Identifier: 0BSD
+
+{;; Uniform Class/.member syntax is 1.12-only; briko runs under babashka
+ ;; too, where traditional interop reads the same.
+ lint/prefer-method-values {:enabled false}}

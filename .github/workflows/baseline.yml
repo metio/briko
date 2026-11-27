@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: The briko Authors
+# SPDX-License-Identifier: 0BSD
+
+name: Baseline
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: metio/ci/.github/workflows/baseline.yml@4ffe6343c7dad75502de503165b853f1959afc8c # 2026.11.21090200
+  baseline:
+    name: Baseline
+    needs: [checks]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULT: ${{ needs.checks.result }}
+        run: '[ "$RESULT" = success ] || { echo "::error::the baseline checks ended in $RESULT"; exit 1; }'

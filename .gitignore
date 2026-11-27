@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: The briko Authors
+# SPDX-License-Identifier: 0BSD
+
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.DS_Store
+.claude/settings.local.json
+.breto.local.edn
+.cpcache/
+.clj-kondo/.cache/
+.lsp/.cache/
+.nrepl-port
+/.eastwood
+/target/

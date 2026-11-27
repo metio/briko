@@ -1,0 +1,4 @@
+;; SPDX-FileCopyrightText: The briko Authors
+;; SPDX-License-Identifier: 0BSD
+
+{:packages ["@graalvm" "@clojure" "@lint"]}

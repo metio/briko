@@ -1,0 +1,6 @@
+;; SPDX-FileCopyrightText: The briko Authors
+;; SPDX-License-Identifier: 0BSD
+
+{;; defspec defines a test var; without this kondo flags every property
+ ;; test name as unresolved
+ :lint-as {clojure.test.check.clojure-test/defspec clojure.core/def}}

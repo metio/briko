@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: The briko Authors
+# SPDX-License-Identifier: 0BSD
+
+version = 1
+SPDX-PackageName = "briko"
+SPDX-PackageDownloadLocation = "https://github.com/metio/briko"
+
+[[annotations]]
+path = "**"
+precedence = "closest"
+SPDX-FileCopyrightText = "The briko Authors"
+SPDX-License-Identifier = "0BSD"
