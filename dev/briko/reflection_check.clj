@@ -3,8 +3,8 @@
 
 (ns briko.reflection-check
   "Loads every namespace under a source directory with reflection warnings
-   on and exits non-zero when the compiler printed one. briko runs in
-   GraalVM native images, where a reflective call fails at run time."
+   on and exits non-zero when the compiler printed a warning. briko runs
+   in GraalVM native images, where a reflective call fails at run time."
   (:require [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (java.io File StringWriter)))
@@ -28,8 +28,9 @@
     (binding [*err* err
               *warn-on-reflection* true]
       (doseq [ns nss] (require ns)))
-    (let [warnings (filter #(str/includes? % "Reflection warning")
-                           (str/split-lines (str err)))]
+    ;; The compiler prints reflection and primitive-loop boxing warnings
+    ;; to *err*; loading prints nothing else, so any output fails the check.
+    (let [warnings (remove str/blank? (str/split-lines (str err)))]
       (println "loaded" (count nss) "namespaces")
       (when (empty? nss)
         (println "no namespace found under" root))

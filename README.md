@@ -30,6 +30,17 @@ Every namespace runs under babashka, on the JVM and in a GraalVM native image:
 
 A function that cannot do its job cleanly throws an `ex-info` whose data carries a stable `:type` keyword, so callers can branch on the failure without parsing messages.
 
+## Namespaces
+
+- `briko.edn` reads EDN from text that may come from anywhere: within a byte limit, valid UTF-8 only, with nesting refused before the recursive reader sees it, every tagged literal refused unless the caller supplies its reader, and exactly one form unless asked otherwise.
+
+```clojure
+(require '[briko.edn :as edn])
+
+(edn/read-file ".tool.edn" {:max-bytes 65536 :expect map?})
+(edn/read-string text {:readers {'inst #(java.time.Instant/parse %)}})
+```
+
 ## Development
 
 The toolchain comes from [breto](https://github.com/metio/breto): run `eval "$(breto env)"` in the checkout, then
