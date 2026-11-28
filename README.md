@@ -26,7 +26,7 @@ Every namespace runs under babashka, on the JVM and in a GraalVM native image:
 
 - it uses only classes babashka exposes;
 - it compiles without reflection warnings, because a reflective call fails at run time in a native image;
-- it depends on nothing beyond Clojure, [babashka.fs](https://github.com/babashka/fs) and [babashka.process](https://github.com/babashka/process). babashka carries both built in; on the JVM they arrive through briko's `deps.edn`. `briko.json` and the JSON functions of `briko.mcp` resolve [cheshire](https://github.com/dakrone/cheshire) when first called: babashka carries it, a JVM consumer declares it, and a native image requires `cheshire.core` (and `cheshire.factory` for `briko.json`) where it is built.
+- it depends on nothing beyond Clojure, [babashka.fs](https://github.com/babashka/fs) and [babashka.process](https://github.com/babashka/process). babashka carries both built in; on the JVM they arrive through briko's `deps.edn`. `briko.json`, and `briko.mcp` through it, resolve [cheshire](https://github.com/dakrone/cheshire) when first called: babashka carries it, a JVM consumer declares it, and a native image requires `cheshire.core` and `cheshire.factory` where it is built.
 
 A function that cannot do its job cleanly throws an `ex-info` whose data carries a stable `:type` keyword, so callers can branch on the failure without parsing messages.
 
@@ -105,7 +105,7 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (ssh-sign/fingerprint (ssh-sign/pubkey "/path/to/key"))  ;; => "SHA256:..."
 ```
 
-- `briko.mcp` handles the messages of a Model Context Protocol server, whatever carries them: the legacy `initialize` handshake and the modern revisions whose every request names its version and capabilities in `_meta`, the header check of modern Streamable HTTP requests, and request dispatch over handlers and a tool registry the caller supplies. A notification gets no response, and a failing handler answers with a JSON-RPC error instead of ending the session. `serve-stdio` answers over stdin and stdout; the HTTP server stays with the caller.
+- `briko.mcp` handles the messages of a Model Context Protocol server, whatever carries them: the legacy `initialize` handshake and the modern revisions whose every request names its version and capabilities in `_meta`, the header check of modern Streamable HTTP requests, and request dispatch over handlers and a tool registry the caller supplies. A notification gets no response, and a failing handler answers with a JSON-RPC error instead of ending the session. Messages are read and written by `briko.json`: a message is exactly one JSON value within `:max-message-bytes` (16 MiB by default), without duplicate keys, nesting over 64 levels or number literals over 100 characters, and anything else answers -32700 with a message and `data.rule` naming the rule it broke, never the text. `write-response` writes an answer with hidden code points escaped, and answers -32603 for a result JSON cannot hold. `serve-stdio` answers over stdin and stdout and refuses a line over `:max-message-bytes` without holding it whole; the HTTP server stays with the caller.
 
 ```clojure
 (require '[briko.mcp :as mcp])
@@ -117,8 +117,11 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
                           [{:name "echo" :description "Echoes text." :inputSchema {:type "object"}
                             :call (fn [args _request] {:text (get args "text")})}])}))
 
-(let [{:keys [response status]} (mcp/handle-line server line {:headers lower-cased-headers})]
-  (when response (mcp/write-json response)))
+(let [{:keys [response status]} (mcp/handle-line server line {:headers lower-cased-headers
+                                                               :max-message-bytes 1048576})]
+  (when response (mcp/write-response response)))
+
+(mcp/serve-stdio server {:max-message-bytes 1048576})
 ```
 
 - `briko.skill-manifest` encodes, signs and verifies the `skill-manifest-v1` manifest of an agent skill served through the MCP Skills extension. A manifest names one skill, lists its SKILL.md, and holds only `skill://` URIs without `.` or `..` segments. The signature namespace and the size limits are arguments of every call. A `:malformed` verdict carries a stable `:code` from `malformed-codes` beside its human-readable `:reason`, so a caller branches on the code.

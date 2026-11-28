@@ -455,3 +455,22 @@
 (deftest any-string-round-trips-without-raw-hidden-code-points
   (let [result (tc/quick-check 300 round-trips :seed 14)]
     (is (:pass? result) (pr-str (select-keys result [:shrunk :seed])))))
+
+(deftest a-var-interned-unbound-is-loaded-before-use
+  (intern (create-ns 'briko.lazy-fixture) 'answer)
+  (is (not (bound? (requiring-resolve 'briko.lazy-fixture/answer)))
+      "negative control: requiring-resolve hands back the unbound var")
+  (is (= 42 ((#'briko.json/loaded-var 'briko.lazy-fixture/answer)))))
+
+(deftest write-string-works-as-the-first-json-call-of-a-jvm
+  ;; cheshire's data_readers.clj interns cheshire.core/generate-string
+  ;; unbound when a JVM starts; babashka carries cheshire loaded.
+  (when-not (System/getProperty "babashka.version")
+    (let [r (p/shell {:out :string :err :string :continue true}
+                     "java" "-cp" (System/getProperty "java.class.path") "clojure.main" "-e"
+                     (str "(prn (bound? (resolve 'cheshire.core/generate-string)))"
+                          "(require 'briko.json)"
+                          "(prn (briko.json/write-string {:a 1}))"))]
+      (is (zero? (:exit r)) (:err r))
+      (is (= ["false" (pr-str "{\"a\":1}")] (str/split-lines (:out r)))
+          "the first line shows the var interned unbound before briko.json runs"))))

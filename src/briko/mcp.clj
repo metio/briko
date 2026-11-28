@@ -40,15 +40,26 @@
    accepted; a modern notification that fails the `_meta` or header
    checks carries the status of the refusal.
 
-   JSON is read and written with cheshire, resolved when first used, so
+   Messages are read and written by briko.json. A message is exactly one
+   JSON value of RFC 8259 no longer than :max-message-bytes in UTF-8
+   (16 MiB unless the caller sets it), nesting at most 64 levels, with no
+   key named twice and no number literal over 100 characters; anything
+   else answers -32700 with a message and :data naming the rule it broke,
+   never the text. Answers are written with every hidden code point
+   escaped as \\uXXXX. briko.json resolves cheshire when first used, so
    the namespace loads on the JVM without the dependency; babashka
-   carries cheshire, and a native image must require `cheshire.core`
-   where it is built. `serve-stdio` answers over stdin and stdout; the
-   HTTP binding (authentication, origin checks, body limits, sessions)
-   stays with the caller, because com.sun.net.httpserver is not in
-   babashka."
-  (:require [clojure.string :as str])
-  (:import (java.io StringReader)
+   carries cheshire, and a native image must require `cheshire.core` and
+   `cheshire.factory` where it is built.
+
+   `serve-stdio` answers over stdin and stdout and holds at most
+   :max-message-bytes characters of a line in memory. The HTTP binding
+   (authentication, origin checks, body limits, sessions) stays with the
+   caller, because com.sun.net.httpserver is not in babashka; it reads
+   with `handle-line` and writes with `write-response`."
+  (:require [briko.json :as json]
+            [clojure.string :as str])
+  (:import (clojure.lang ExceptionInfo)
+           (java.io Reader)
            (java.nio.charset StandardCharsets)
            (java.util Base64)))
 
@@ -107,25 +118,78 @@
 
 ;; JSON
 
-(defn- json-fn [sym] (requiring-resolve sym))
+(def defaults
+  "The options `handle-line`, `read-json` and `serve-stdio` use where the
+   caller gives none.
+
+   - :max-message-bytes, the longest message in UTF-8 bytes: 16 MiB."
+  {:max-message-bytes 16777216})
+
+(defn- options
+  "`opts` merged over `defaults`, refusing a key outside `allowed` and a
+   :max-message-bytes that is no positive int below Integer/MAX_VALUE."
+  [opts allowed]
+  (when-not (or (nil? opts) (map? opts))
+    (throw (ex-info "the options must be a map" {:type ::invalid-arguments})))
+  (when-let [unknown (seq (remove allowed (keys opts)))]
+    (throw (ex-info (str "unknown options " (pr-str (vec unknown)))
+                    {:type ::invalid-arguments :unknown (vec unknown)})))
+  (let [opts (merge defaults opts)
+        limit (:max-message-bytes opts)]
+    (when-not (and (int? limit) (< 0 (long limit) Integer/MAX_VALUE))
+      (throw (ex-info ":max-message-bytes must be a positive int below Integer/MAX_VALUE"
+                      {:type ::invalid-arguments :option :max-message-bytes})))
+    opts))
+
+(defn- read-message
+  "The JSON value `s` holds, or the briko.json refusal of it."
+  [s max-message-bytes]
+  (try
+    (json/parse-string s {:max-bytes max-message-bytes})
+    (catch ExceptionInfo e
+      (if (json/refusal? e) e (throw e)))))
+
+(defn- parse-error-answer
+  "The -32700 answer to a message briko.json refused. The message and
+   :data name the rule (`rule`, and :line and :column where the refusal
+   has them); neither quotes the text."
+  [message rule position]
+  {:response (error-object nil parse-error (str "parse error: " message)
+                           (merge {:rule rule} (select-keys position [:line :column])))
+   :status 200})
 
 (defn read-json
-  "The single JSON value `s` holds, or ::unreadable when it is not
-   exactly one well-formed JSON value. Text after the value is refused:
-   a reader that stops at the first value would answer a request other
-   than the one the bytes hold."
-  [s]
-  (if-not (string? s)
-    ::unreadable
-    (try
-      (let [values (doall (take 2 ((json-fn 'cheshire.core/parsed-seq) (StringReader. ^String s))))]
-        (if (= 1 (count values)) (first values) ::unreadable))
-      (catch Exception _ ::unreadable))))
+  "The single JSON value `s` holds, or ::unreadable when briko.json
+   refuses it: not exactly one value, longer than :max-message-bytes,
+   or breaking one of its rules (see the namespace doc). `opts`:
+   :max-message-bytes."
+  ([s] (read-json s nil))
+  ([s opts]
+   (let [msg (read-message s (:max-message-bytes (options opts #{:max-message-bytes})))]
+     (if (instance? Throwable msg) ::unreadable msg))))
 
 (defn write-json
-  "x as a JSON string."
+  "x as a JSON string, written by briko.json/write-string: hidden code
+   points escaped, and a map whose keys print to one name refused with
+   that namespace's ex-info."
   [x]
-  ((json-fn 'cheshire.core/generate-string) x))
+  (json/write-string x))
+
+(defn write-response
+  "A response as handle-message returns it, as one line of JSON. A
+   response briko.json refuses to write (keys that print to one name, a
+   value nested deeper than it prints, a value JSON cannot encode)
+   becomes a -32603 error for the same id, naming the rule."
+  [response]
+  (try
+    (json/write-string response)
+    (catch ExceptionInfo e
+      (if (json/refusal? e)
+        (json/write-string
+         (error-object (:id response) internal-error
+                       (str "internal error: the response cannot be written as JSON: " (ex-message e))
+                       {:rule (name (:type (ex-data e)))}))
+        (throw e)))))
 
 ;; Headers
 
@@ -234,7 +298,7 @@
 
 (defn handle-message
   "`{:response r :status s}` for one parsed JSON-RPC message `msg`
-   (string keys, as cheshire reads JSON): r is the response map, nil for
+   (string keys, as briko.json reads JSON): r is the response map, nil for
    a notification, and s the HTTP status it calls for. `opts`:
    :headers, the HTTP request's headers as lower-case names to a string
    or a collection of strings; nil or absent on stdio."
@@ -284,14 +348,17 @@
 
 (defn handle-line
   "`{:response r :status s}` for one JSON-RPC message as text, as
-   handle-message answers it. Text that is not exactly one JSON value
-   answers -32700 with a null id."
+   handle-message answers it. Text that briko.json refuses (see the
+   namespace doc) answers -32700 with a null id. `opts`: :headers, as
+   handle-message takes them; :max-message-bytes."
   ([server line] (handle-line server line nil))
   ([server line opts]
-   (let [msg (read-json line)]
-     (if (= ::unreadable msg)
-       {:response (error-object nil parse-error "parse error: not a JSON value" nil) :status 200}
-       (handle-message server msg opts)))))
+   (let [{:keys [max-message-bytes headers]} (options opts #{:headers :max-message-bytes})
+         msg (read-message line max-message-bytes)]
+     (if (instance? Throwable msg)
+       (let [data (ex-data msg)]
+         (parse-error-answer (ex-message msg) (name (:type data)) data))
+       (handle-message server msg {:headers headers})))))
 
 ;; Tools
 
@@ -332,14 +399,76 @@
     (throw (ex-info "a server needs :handlers, method names to functions" {:type ::invalid-arguments})))
   opts)
 
+(defn- line-reader
+  "A function returning the next line of `r` on each call: the line
+   without its newline (and a carriage return before it), ::too-long for
+   a line of more than `limit` characters, or nil once `r` ends. It holds
+   at most `limit` characters of a line plus one read buffer; the rest of
+   a line that is too long is read and dropped. A line of more than
+   `limit` characters has more than `limit` UTF-8 bytes, since no
+   character takes fewer bytes than UTF-16 units."
+  [^Reader r ^long limit]
+  (let [buf (char-array 8192)
+        pending (StringBuilder.)
+        state (volatile! {:scanned 0 :skipping? false :ended? false})
+        take! (fn [^long end]
+                ;; what pending holds up to end, dropping one more
+                ;; character (the newline), and giving back the capacity
+                ;; a long line left behind
+                (let [text (.substring pending 0 end)]
+                  (.delete pending 0 (min (.length pending) (inc end)))
+                  (when (> (.capacity pending) 65536) (.trimToSize pending))
+                  (vswap! state assoc :scanned 0 :skipping? false)
+                  text))]
+    (fn next-line []
+      (let [{:keys [scanned skipping? ended?]} @state
+            nl (.indexOf pending "\n" (int scanned))]
+        (cond
+          (>= nl 0)
+          (let [text (take! nl)
+                text (if (str/ends-with? text "\r") (subs text 0 (dec (count text))) text)]
+            (if (or skipping? (> (count text) limit)) ::too-long text))
+
+          ended?
+          (let [text (take! (.length pending))]
+            (cond
+              skipping? ::too-long
+              (zero? (count text)) nil
+              (> (count text) limit) ::too-long
+              :else text))
+
+          :else
+          (do
+            ;; one more than limit leaves room for the carriage return
+            (when (or skipping? (> (.length pending) (inc limit)))
+              (.setLength pending 0)
+              (when-not skipping? (.trimToSize pending))
+              (vswap! state assoc :skipping? true))
+            (let [n (.read r buf)]
+              (vswap! state assoc :scanned (.length pending))
+              (if (neg? n)
+                (vswap! state assoc :ended? true)
+                (.append pending buf 0 n)))
+            (recur)))))))
+
 (defn serve-stdio
   "Answers one JSON-RPC message per line of *in* on *out*, one response
    per line, flushed after each, until *in* ends. A notification writes
-   nothing."
-  [server]
-  (loop []
-    (when-let [line (read-line)]
-      (when-let [response (:response (handle-line server line))]
-        (println (write-json response))
-        (flush))
-      (recur))))
+   nothing. A line longer than :max-message-bytes answers -32700 without
+   being held in memory whole, and the next line is read as usual.
+   `opts`: :max-message-bytes."
+  ([server] (serve-stdio server nil))
+  ([server opts]
+   (let [{:keys [max-message-bytes]} (options opts #{:max-message-bytes})
+         next-line (line-reader *in* max-message-bytes)
+         too-long (parse-error-answer (format "the input is larger than %d bytes" max-message-bytes)
+                                      (name ::json/too-large) nil)]
+     (loop []
+       (when-let [line (next-line)]
+         (let [answer (if (= ::too-long line)
+                        too-long
+                        (handle-line server line {:max-message-bytes max-message-bytes}))]
+           (when-let [response (:response answer)]
+             (println (write-response response))
+             (flush)))
+         (recur))))))
