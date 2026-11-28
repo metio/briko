@@ -169,6 +169,64 @@
                 (= out (str "/h" (subs s 1)))
                 (= out s))))))
 
+;; abbreviate-home
+
+(deftest abbreviate-home-replaces-the-home-directory-with-a-tilde
+  (let [opts (env {"HOME" "/home/seb"})]
+    (is (= "~" (paths/abbreviate-home "/home/seb" opts)))
+    (is (= "~/" (paths/abbreviate-home "/home/seb/" opts)))
+    (is (= "~/x/y" (paths/abbreviate-home "/home/seb/x/y" opts)))
+    (is (= "~/a//b" (paths/abbreviate-home "/home/seb/a//b" opts)) "the rest of the path is kept as it is")))
+
+(deftest abbreviate-home-matches-on-a-path-boundary-only
+  (let [opts (env {"HOME" "/home/seb"})]
+    (doseq [s ["/home/sebastian" "/home/sebastian/x" "/home/seb-old/x" "/home/se" "/home" "/" "/other/home/seb"]]
+      (testing s
+        (is (= s (paths/abbreviate-home s opts))))))
+  (testing "negative control: the sibling shares the home directory's characters"
+    (is (str/starts-with? "/home/sebastian" "/home/seb"))))
+
+(deftest abbreviate-home-leaves-relative-and-tilde-strings-alone
+  (let [opts (env {"HOME" "/home/seb"})]
+    (doseq [s ["" "x" "home/seb" "~" "~/x" "~seb/x" "./home/seb"]]
+      (testing (pr-str s)
+        (is (= s (paths/abbreviate-home s opts)))))))
+
+(deftest abbreviate-home-resolves-home-as-home-does
+  (testing "user.home when HOME is relative"
+    (is (= "~/x" (paths/abbreviate-home "/passwd/home/x" (env {"HOME" "rel"})))))
+  (testing "HOME normalised as home prints it"
+    (is (= "~/x" (paths/abbreviate-home "/h/x" (env {"HOME" "/h//"})))))
+  (testing "HOME preferred over user.home"
+    (is (= "/passwd/home/x" (paths/abbreviate-home "/passwd/home/x" (env {"HOME" "/h"}))))))
+
+(deftest abbreviate-home-without-a-home-returns-the-path
+  (is (= "/h/x" (paths/abbreviate-home "/h/x" (env {} {}))))
+  (testing "negative control: home refuses in the same environment"
+    (is (= ::paths/no-home (refusal #(paths/home (env {} {})))))))
+
+(deftest abbreviate-home-with-the-root-as-home
+  (let [opts (env {"HOME" "/"})]
+    (is (= "~" (paths/abbreviate-home "/" opts)))
+    (is (= "/etc" (paths/abbreviate-home "/etc" opts)))))
+
+(deftest abbreviate-home-passes-nil-and-refuses-other-types
+  (is (nil? (paths/abbreviate-home nil)))
+  (is (= ::paths/invalid-input (refusal #(paths/abbreviate-home :x))))
+  (is (= ::paths/invalid-input (refusal #(paths/abbreviate-home (fs/path "/x")))))
+  (is (= ::paths/invalid-options (refusal #(paths/abbreviate-home "/x" {:home "/x"})))))
+
+(deftest abbreviate-home-of-the-real-environment
+  (is (= "~" (paths/abbreviate-home (paths/home))))
+  (is (= "~/x" (paths/abbreviate-home (str (paths/home) "/x")))))
+
+(deftest property-abbreviate-home-reads-back-through-expand-home
+  (let [opts (env {"HOME" "/h"})]
+    (holds? 500
+            (prop/for-all [s (gen/fmap (fn [[prefix tail]] (str prefix tail))
+                                       (gen/tuple (gen/elements ["/" "/h" "/h/" "/hx" "/h/h"]) gen/string-ascii))]
+              (= s (paths/expand-home (paths/abbreviate-home s opts) opts))))))
+
 ;; load-edn-config
 
 (def ^:private config-defaults

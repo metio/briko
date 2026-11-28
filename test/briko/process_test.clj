@@ -282,7 +282,8 @@
                 {:timeout-ms nil} {:timeout-ms :never} {:timeout-ms "none"}
                 {:in :terminal} {:in {:file 1}} {:in {:file ""}} {:in {:path "x"}} {:in {:file "x" :mode :r}}
                 {:out "file"} {:out :file} {:out {:file ""}} {:out {:file "x" :append true}} {:out {:file "a\u0000b"}}
-                {:out-keep :middle} {:err-keep "tail"} {:out-keep nil}]]
+                {:out-keep :middle} {:err-keep "tail"} {:out-keep nil}
+                {:on-start 1} {:on-start :start} {:on-start {}} {:on-start "f"}]]
     (is (= ::process/invalid-options (refusal #(process/run ["true"] opts))) (pr-str opts))))
 
 (deftest a-refusal-does-not-echo-the-argv
@@ -524,3 +525,147 @@
       (if has-tty?
         (is (zero? (:exit r)))
         (is (= 127 (:exit r)))))))
+
+;; Stopping a run from outside
+
+(defn- run-in-thread
+  "Starts (process/run argv opts) on a thread of its own. Returns a promise
+   of its result, or of [:threw e]."
+  [argv opts]
+  (let [outcome (promise)]
+    (doto (Thread. ^Runnable
+           (fn []
+             (try
+               (deliver outcome (process/run argv opts))
+               (catch Exception e
+                 (deliver outcome [:threw e])))))
+      (.start))
+    outcome))
+
+(deftest a-shutdown-hook-can-stop-a-run-without-a-deadline
+  (with-temp-dir [dir]
+    (let [self (fs/path dir "self")
+          child (fs/path dir "child")
+          grandchild (fs/path dir "grandchild")
+          script (str "echo $$ > " self "; echo started; "
+                      "sleep 300 & echo $! > " child "; "
+                      "sh -c 'sleep 300 & echo $! > " grandchild "; wait' & "
+                      "wait")
+          handle (promise)
+          outcome (run-in-thread ["sh" "-c" script] {:timeout-ms :none :on-start (fn [h] (deliver handle h))})
+          pids [(read-pid self) (read-pid child) (read-pid grandchild)]]
+      (try
+        (is (= (first pids) (:pid (deref handle 5000 nil))) "the handle names the program")
+        (is (= :running (deref outcome 300 :running)) "negative control: without a stop the run goes on")
+        ;; A shutdown hook is a Thread the JVM starts on exit; this one is
+        ;; started by hand.
+        (let [hook (Thread. ^Runnable (fn [] ((:stop @handle))))
+              [r ms] (elapsed-ms (fn [] (.start hook) (.join hook 10000) (deref outcome 10000 :hung)))]
+          (is (map? r) (pr-str r))
+          (is (= {:exit 137 :stopped? true :timed-out? false :launched? true}
+                 (select-keys r [:exit :stopped? :timed-out? :launched?])))
+          (is (= "started\n" (:out r)) "output written before the stop is kept")
+          (is (< ms 5000) (str "took " ms " ms")))
+        (doseq [pid pids]
+          (is (gone-within? pid 5000) (str "process " pid " survived the stop")))
+        (finally (run! kill! pids))))))
+
+(deftest a-stop-kills-a-detached-holder-of-the-output
+  (with-temp-dir [dir]
+    (let [pid-file (fs/path dir "pid")
+          handle (promise)
+          outcome (run-in-thread ["sh" "-c" (str "sleep 300 & echo $! > " pid-file)]
+                                 {:timeout-ms :none :on-start (fn [h] (deliver handle h))})
+          pid (read-pid pid-file)]
+      (try
+        (is (= :running (deref outcome 300 :running)) "negative control: the holder keeps the run open")
+        (is (true? ((:stop (deref handle 5000 nil)))))
+        (let [r (deref outcome 10000 :hung)]
+          (is (= {:exit 0 :stopped? true :timed-out? false} (select-keys r [:exit :stopped? :timed-out?]))
+              "the program itself had exited; the stop ended the holder"))
+        (is (gone-within? pid 5000) (str "the holder " pid " survived the stop"))
+        (finally (kill! pid))))))
+
+(deftest stop-is-idempotent-and-inert-once-the-run-returned
+  (testing "concurrent stops: exactly one takes effect"
+    (let [handle (promise)
+          outcome (run-in-thread ["sleep" "300"] {:timeout-ms :none :on-start (fn [h] (deliver handle h))})
+          {:keys [stop pid]} (deref handle 5000 nil)
+          start (promise)
+          answers (mapv (fn [_] (future @start (stop))) (range 8))]
+      (try
+        (deliver start true)
+        (is (= [false false false false false false false true] (sort (map deref answers))))
+        (is (false? (stop)))
+        (is (true? (:stopped? (deref outcome 10000 :hung))))
+        (finally (kill! pid)))))
+  (testing "after a run finished on its own"
+    (let [handle (atom nil)
+          r (process/run ["echo" "hi"] {:on-start (fn [h] (reset! handle h))})]
+      (is (= {:exit 0 :out "hi\n" :stopped? false} (select-keys r [:exit :out :stopped?])))
+      (is (false? ((:stop @handle))))
+      (is (false? ((:stop @handle))))))
+  (testing "after a timeout"
+    (let [handle (atom nil)
+          r (process/run ["sleep" "300"] {:timeout-ms 200 :on-start (fn [h] (reset! handle h))})]
+      (is (= {:exit 124 :timed-out? true :stopped? false} (select-keys r [:exit :timed-out? :stopped?])))
+      (is (false? ((:stop @handle)))))))
+
+(deftest a-run-without-on-start-keeps-its-result
+  (let [plain (process/run ["sh" "-c" "echo out; echo err >&2; exit 3"])
+        watched (process/run ["sh" "-c" "echo out; echo err >&2; exit 3"] {:on-start (fn [_])})]
+    (is (not (contains? plain :stopped?)))
+    (is (= (assoc plain :stopped? false) watched))))
+
+(deftest on-start-is-called-once-and-not-for-a-failed-launch
+  (let [calls (atom [])]
+    (process/run ["true"] {:on-start (fn [h] (swap! calls conj h))})
+    (is (= 1 (count @calls)))
+    (is (pos-int? (:pid (first @calls))))
+    (is (fn? (:stop (first @calls)))))
+  (let [calls (atom 0)
+        r (process/run ["briko-no-such-program-0f3a"] {:on-start (fn [_] (swap! calls inc))})]
+    (is (= 127 (:exit r)))
+    (is (zero? @calls))))
+
+(deftest a-callback-may-stop-its-own-run
+  (let [r (process/run ["sleep" "300"] {:timeout-ms :none :on-start (fn [{:keys [stop]}] (stop))})]
+    (is (= {:exit 137 :stopped? true} (select-keys r [:exit :stopped?])))))
+
+(deftest a-throwing-callback-stops-the-program-and-refuses
+  (doseq [[what thrown] [["an exception" (ex-info "callback broke" {:secret "dummy-value"})]
+                         ["an error" (AssertionError. "callback asserted")]]]
+    (testing what
+      (let [pid (atom nil)
+            handle (atom nil)
+            [outcome ms] (elapsed-ms
+                          #(try
+                             (process/run ["sleep" "300"]
+                                          {:timeout-ms :none
+                                           :on-start (fn [h] (reset! handle h) (reset! pid (:pid h)) (throw thrown))})
+                             :returned
+                             (catch clojure.lang.ExceptionInfo e e)))]
+        (try
+          (is (= ::process/on-start-failed (:type (ex-data outcome))))
+          (is (process/refusal? outcome))
+          (is (identical? thrown (ex-cause outcome)))
+          (is (not (str/includes? (str (ex-message outcome) (pr-str (ex-data outcome))) "dummy-value"))
+              "the callback's data stays in the cause")
+          (is (< ms 5000) (str "took " ms " ms"))
+          (is (gone-within? @pid 5000) "the program survived its callback")
+          (is (false? ((:stop @handle))))
+          (finally (some-> @pid kill!)))))))
+
+(deftest an-interrupted-callback-stops-the-program-and-rethrows
+  (let [pid (atom nil)
+        outcome (try
+                  (process/run ["sleep" "300"]
+                               {:timeout-ms :none
+                                :on-start (fn [h] (reset! pid (:pid h)) (throw (InterruptedException. "hook")))})
+                  :returned
+                  (catch InterruptedException _
+                    [:interrupted (Thread/interrupted)]))]
+    (try
+      (is (= [:interrupted true] outcome))
+      (is (gone-within? @pid 5000))
+      (finally (some-> @pid kill!)))))
