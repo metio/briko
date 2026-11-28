@@ -221,7 +221,7 @@
       (is (string? (json/parse-string (str "\"" (digits 500) "\""))))
       (is (map? (json/parse-string (str "{\"" (digits 500) "\":1}")))))
     (testing "Jackson's limit refuses a long integer when the scan is bypassed"
-      (with-redefs-fn {#'json/check-numbers! (fn [_ _] nil)}
+      (with-redefs-fn {#'json/check-numbers! (fn [_ _] nil) #'json/scan-numbers! (fn [_ _] nil)}
         #(is (= ::json/number-too-long (refused (digits 101))))))))
 
 (deftest a-number-that-overflows-a-double-is-refused
