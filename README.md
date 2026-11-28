@@ -131,13 +131,14 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (bfs/write-private! (str dir "/token") token)
 ```
 
-- `briko.digest` computes SHA-256 of bytes, text (UTF-8), streams and files, the last two in bounded memory, and prints digests as lowercase hex without a prefix; a format that writes `sha256-` or `sha256:` adds its own.
+- `briko.digest` computes SHA-256 and SHA-512 of bytes, text (UTF-8), streams and files, the last two in bounded memory, and prints digests as lowercase hex without a prefix; a format that writes `sha256-` or `sha256:` adds its own. `checksum-hex`, `checksum-hex-stream` and `checksum-hex-file` take `:md5`, `:sha1`, `:sha256` or `:sha512` for comparing a download with the checksum its publisher printed; MD5 and SHA-1 are offered only there.
 
 ```clojure
 (require '[briko.digest :as digest])
 
 (digest/sha256-hex "abc")              ;; => "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 (str "sha256-" (digest/sha256-hex-file "archive.tar.gz"))
+(= published-md5 (digest/checksum-hex-file :md5 "archive.tar.gz"))
 ```
 
 - `briko.inventory` reads and writes the repository inventory aro writes and krei reads: one EDN map from source id to records, sources sorted by id and records by path, one record per line, below a header of comment lines that survives a rewrite. Reading goes through `briko.edn` within 8 MiB, with no tagged literal, and refuses a record whose keys or values do not fit `record-keys`, or a source that lists one repository twice. `write!` replaces the file through `briko.fs/atomic-write!` only when its text changed; `default-path` is `aro/inventory.edn` in the XDG state home.
