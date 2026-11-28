@@ -176,7 +176,7 @@
 ;; Configuration files
 
 (def ^:private config-keys
-  (into env-keys #{:edn :home-paths :missing}))
+  (into env-keys #{:edn :home-paths :missing :empty :dangling}))
 
 (defn- expand-value
   [opts v]
@@ -197,7 +197,7 @@
           home-paths))
 
 (defn- check-config-options!
-  [path defaults-map {:keys [edn home-paths missing]}]
+  [path defaults-map {:keys [edn home-paths missing dangling] empty-file :empty}]
   (when-not (or (string? path) (instance? java.nio.file.Path path) (instance? java.io.File path))
     (refuse! ::invalid-input "the configuration path must be a string, Path or File" {}))
   (when-not (map? defaults-map)
@@ -210,7 +210,11 @@
                  (every? #(and (vector? %) (seq %)) home-paths))
     (refuse! ::invalid-options ":home-paths must be a collection of non-empty key vectors" {:option :home-paths}))
   (when-not (contains? #{nil :defaults :refuse} missing)
-    (refuse! ::invalid-options ":missing must be :defaults or :refuse" {:option :missing})))
+    (refuse! ::invalid-options ":missing must be :defaults or :refuse" {:option :missing}))
+  (when-not (contains? #{nil :defaults :refuse} empty-file)
+    (refuse! ::invalid-options ":empty must be :defaults or :refuse" {:option :empty}))
+  (when-not (contains? #{nil :missing :refuse} dangling)
+    (refuse! ::invalid-options ":dangling must be :missing or :refuse" {:option :dangling})))
 
 (defn load-edn-config
   "The configuration in the EDN file at path, a map, merged over the map
@@ -232,20 +236,40 @@
      :missing     :defaults (default) returns defaults-map, expanded,
                   when nothing exists at path; :refuse refuses with
                   ::missing
+     :empty       :refuse (default) passes on briko.edn's
+                  :briko.edn/no-form refusal for a file that holds no
+                  form (empty, blank, or only comments and discarded
+                  forms); :defaults reads such a file as an empty map,
+                  so the result is defaults-map, expanded
+     :dangling    :refuse (default) leaves a symbolic link at path whose
+                  target does not exist to briko.edn, which refuses it
+                  as not a regular file; :missing treats it as nothing
+                  at path, so :missing decides
 
-   A dangling symbolic link at path is not missing: briko.edn refuses it
-   as not a regular file."
+   Both :empty and :dangling refuse by default because an empty file or
+   a broken link is as often a truncated write or a mistake as a
+   deliberate choice of the defaults, and silently running on defaults
+   can widen what a program does. A caller whose earlier releases read
+   either as the defaults opts in."
   ([path defaults-map] (load-edn-config path defaults-map nil))
   ([path defaults-map opts]
    (let [opts (env-options opts config-keys)
          _ (check-config-options! path defaults-map opts)
-         {:keys [edn home-paths missing]} opts
-         present? (fs/exists? path {:nofollow-links true})]
+         {:keys [edn home-paths missing dangling] empty-file :empty} opts
+         present? (and (fs/exists? path {:nofollow-links true})
+                       (not (and (= :missing dangling)
+                                 (fs/sym-link? path)
+                                 (not (fs/exists? path)))))]
      (when (and (not present?) (= :refuse missing))
        (refuse! ::missing (str "the configuration file " path " does not exist") {:file (str path)}))
      (let [expect (:expect edn)
+           read-opts (assoc edn :expect (if expect
+                                          (fn [x] (and (map? x) (expect x)))
+                                          map?))
            user (when present?
-                  (edn/read-file path (assoc edn :expect (if expect
-                                                           (fn [x] (and (map? x) (expect x)))
-                                                           map?))))]
+                  (try
+                    (edn/read-file path read-opts)
+                    (catch clojure.lang.ExceptionInfo e
+                      (when-not (and (= :defaults empty-file) (= ::edn/no-form (:type (ex-data e))))
+                        (throw e)))))]
        (expand-paths (merge defaults-map user) home-paths opts)))))

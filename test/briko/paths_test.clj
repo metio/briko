@@ -229,3 +229,60 @@
   (is (= ::paths/invalid-options (refusal #(paths/load-edn-config "/x" {} {:home-paths [:a]}))))
   (is (= ::paths/invalid-options (refusal #(paths/load-edn-config "/x" {} {:missing :ignore}))))
   (is (= ::paths/invalid-options (refusal #(paths/load-edn-config "/x" {} {:edn 1})))))
+
+(deftest load-edn-config-can-read-a-file-without-a-form-as-the-defaults
+  (with-temp-dir [dir]
+    (let [f (str dir "/c.edn")
+          opts (assoc (env {"HOME" "/h"}) :home-paths [[:store]] :empty :defaults)]
+      (doseq [text ["" "   \n\t" ";; only a comment\n" "; one\n;; two\n" "#_{:keep 9}"]]
+        (spit f text)
+        (testing (pr-str text)
+          (is (= (assoc config-defaults :store "/h/store") (paths/load-edn-config f config-defaults opts)))
+          (is (= :briko.edn/no-form (refusal #(paths/load-edn-config f config-defaults (dissoc opts :empty))))
+              "refused without the option")
+          (is (= :briko.edn/no-form (refusal #(paths/load-edn-config f config-defaults (assoc opts :empty :refuse))))
+              "refused with :empty :refuse"))))))
+
+(deftest load-edn-config-with-empty-defaults-still-refuses-every-other-file
+  (with-temp-dir [dir]
+    (let [f (str dir "/c.edn")]
+      (doseq [[text type] [["[1 2]" :briko.edn/unexpected]
+                           ["nil" :briko.edn/unexpected]
+                           [";; c\n{:a 1} {:b 2}" :briko.edn/trailing-form]
+                           ["{:a" :briko.edn/malformed]]]
+        (spit f text)
+        (testing text
+          (is (= type (refusal #(paths/load-edn-config f {} {:empty :defaults})))))))))
+
+(deftest load-edn-config-with-empty-defaults-still-honours-expect
+  (with-temp-dir [dir]
+    (let [f (str dir "/c.edn")]
+      (spit f "{:a 1}")
+      (is (= :briko.edn/unexpected (refusal #(paths/load-edn-config f {} {:empty :defaults :edn {:expect :b}}))))
+      (spit f "")
+      (is (= {:b 2} (paths/load-edn-config f {:b 2} {:empty :defaults :edn {:expect :b}}))))))
+
+(deftest load-edn-config-can-treat-a-dangling-link-as-missing
+  (with-temp-dir [dir]
+    (let [link (str dir "/link.edn")
+          target (str dir "/nowhere.edn")]
+      (fs/create-sym-link link target)
+      (is (= {:a 1} (paths/load-edn-config link {:a 1} {:dangling :missing})))
+      (is (= ::paths/missing (refusal #(paths/load-edn-config link {} {:dangling :missing :missing :refuse}))))
+      (is (= :briko.edn/not-a-file (refusal #(paths/load-edn-config link {} {:dangling :refuse}))))
+      (testing "a link whose target exists is read through"
+        (spit target "{:a 2}")
+        (is (= {:a 2} (paths/load-edn-config link {:a 1} {:dangling :missing})))))))
+
+(deftest load-edn-config-with-dangling-missing-still-refuses-a-directory-and-a-link-to-one
+  (with-temp-dir [dir]
+    (let [link (str dir "/dir-link.edn")]
+      (fs/create-sym-link link dir)
+      (is (= :briko.edn/not-a-file (refusal #(paths/load-edn-config dir {} {:dangling :missing}))))
+      (is (= :briko.edn/not-a-file (refusal #(paths/load-edn-config link {} {:dangling :missing})))))))
+
+(deftest load-edn-config-checks-the-empty-and-dangling-options
+  (is (= ::paths/invalid-options (refusal #(paths/load-edn-config "/x" {} {:empty :ignore}))))
+  (is (= ::paths/invalid-options (refusal #(paths/load-edn-config "/x" {} {:empty true}))))
+  (is (= ::paths/invalid-options (refusal #(paths/load-edn-config "/x" {} {:dangling :defaults}))))
+  (is (= ::paths/invalid-options (refusal #(paths/load-edn-config "/x" {} {:dangling true})))))
