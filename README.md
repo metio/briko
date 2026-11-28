@@ -76,6 +76,16 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (process/run ["make" "release"] {:timeout-ms :none :on-start (fn [handle] (reset! running handle))})
 ```
 
+  `start` runs a program alongside the caller, such as an SSH tunnel or a port-forward, through the same named pipes, and returns a handle `{:pid … :launched? …}`. The program has no deadline; its output is read all the time and only the last 64 KiB of each stream are kept (`:max-out-bytes`, `:max-err-bytes`), or stdout goes to `{:file path}`. `output` returns what was kept, `alive?` whether it runs. `wait-ready` waits until a line of output matches `:pattern` (on `:out` or `:err`) or a `:port` on the loopback interface accepts, within `:timeout-ms` (30 s by default, never unbounded), and optionally that the program still runs `:settle-ms` later; it refuses with `:briko.process/exited-before-ready` (data `:exit`) or `:briko.process/ready-timeout` and closes the program first unless `:close-on-refusal? false`. `close` kills the program, its tree and every holder of its output, is idempotent, and returns the exit (137 after SIGKILL, the program's own when it had exited). One JVM shutdown hook stops every started program still running, unless it was started with `:stop-on-exit? false`. A program that cannot be started, also for want of `mkfifo`, gives a handle with `:launched? false` that `close` answers with 127.
+
+```clojure
+(let [tunnel (process/start ["ssh" "-N" "-o" "ExitOnForwardFailure=yes" "-L" (str "127.0.0.1:" port ":forge:443") host])]
+  (try
+    (process/wait-ready tunnel {:port port :settle-ms 1000 :timeout-ms 15000})
+    (call-forge port)
+    (finally (process/close tunnel))))
+```
+
 - `briko.secret` resolves secrets named in configuration at the moment of use: `{:env "NAME"}`, `{:file "/path"}`, `{:credential "NAME"}` (systemd credentials) and `{:command ["pass" "show" "x"]}`. An unset variable, a missing file, an empty or blank value and a command that fails or overruns its deadline are refused; no refusal carries the secret or the command's output.
 
 ```clojure
