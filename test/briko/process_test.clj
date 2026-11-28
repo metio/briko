@@ -480,9 +480,12 @@
 
 (deftest a-failed-write-to-the-stdout-file-is-reported
   (with-redefs-fn {#'briko.process/open-output-file (fn [_] (failing-stream))}
-    #(let [r (process/run ["head" "-c" "1000000" "/dev/zero"] {:out {:file "unused"}})]
+    ;; yes writes until a write fails, so it ends only because the pipe
+    ;; lost its reader; a run that kept reading would end at the deadline.
+    #(let [r (process/run ["yes"] {:out {:file "unused"} :timeout-ms 20000})]
        (is (str/includes? (str (:out-error r)) "No space left on device"))
        (is (zero? (:out-bytes r)))
+       (is (false? (:timed-out? r)))
        (is (not (zero? (:exit r))) "the program's next write fails"))))
 
 ;; Stdin from a file or the terminal
