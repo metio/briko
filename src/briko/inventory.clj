@@ -50,10 +50,10 @@
   "The options where the caller gives none.
 
    - :max-bytes, the largest inventory in UTF-8 bytes: 8 MiB. A record
-     takes about 200 bytes, or about 600 with custom properties, so the
-     limit holds some 14000 repositories at their largest and 40000 at a
-     usual size. `write!` refuses to write more than it, so a file written
-     here can always be read back with the same limit.
+     takes about 200 bytes, or about 400 with a few custom properties, so
+     the limit holds some 20000 to 40000 repositories. `write!` refuses to
+     write more than it, so a file written here can always be read back
+     with the same limit.
    - :missing, what `read-file` does when no file is at the path: :refuse,
      or :empty for an inventory without sources.
    - :fsync?, for `write!`, whether the new file reaches the disk before
