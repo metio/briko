@@ -109,17 +109,84 @@
             (is (gone-within? pid 5000) (str "process " pid " survived the timeout")))
           (finally (run! kill! pids)))))))
 
+(defn- detached-holder
+  "Runs a shell that starts `sleep 300` in the background, holding the
+   output named by redirect, writes its pid and exits at once. Returns
+   [result elapsed-ms pid]."
+  ([dir] (detached-holder dir "" {}))
+  ([dir redirect opts]
+   (let [pid-file (fs/path dir (str "pid-" (random-uuid)))
+         [r ms] (elapsed-ms #(process/run ["sh" "-c" (str "sleep 300 " redirect " & echo $! > " pid-file)]
+                                          (merge {:timeout-ms 500} opts)))]
+     [r ms (read-pid pid-file)])))
+
+(defn- with-delayed-threads
+  "Calls f with every thread of briko.process starting delay-ms late, so
+   the program exits before its output is read."
+  [delay-ms f]
+  (let [daemon! @#'briko.process/daemon!]
+    (with-redefs-fn {#'briko.process/daemon! (fn [g] (daemon! (fn [] (Thread/sleep (long (delay-ms))) (g))))}
+      f)))
+
 (deftest a-detached-child-holding-the-output-cannot-stall-the-caller
   (with-temp-dir [dir]
-    (let [pid-file (fs/path dir "pid")
-          [r ms] (elapsed-ms #(process/run ["sh" "-c" (str "sleep 300 & echo $! > " pid-file)]
-                                           {:timeout-ms 500}))
-          pid (read-pid pid-file)]
+    (doseq [[what redirect opts] [["stdout" "" {}]
+                                  ["stderr" ">/dev/null" {}]
+                                  ["stdout with stderr inherited" "2>/dev/null" {:inherit-err? true}]]]
+      (testing what
+        (let [[r ms pid] (detached-holder dir redirect opts)]
+          (try
+            (is (= 124 (:exit r)))
+            (is (true? (:timed-out? r)))
+            (is (< ms 5000) (str "took " ms " ms"))
+            (is (gone-within? pid 5000) (str "the detached process " pid " survived the timeout"))
+            (finally (kill! pid))))))))
+
+(deftest a-detached-holder-is-a-timeout-even-when-the-program-exits-before-its-output-is-read
+  (with-temp-dir [dir]
+    (let [[r _ pid] (with-delayed-threads (constantly 200) #(detached-holder dir))]
       (try
-        (is (= 124 (:exit r)))
-        (is (true? (:timed-out? r)))
+        (is (= {:exit 124 :timed-out? true} (select-keys r [:exit :timed-out?])))
+        (is (gone-within? pid 5000) (str "the detached process " pid " survived the timeout"))
+        (finally (kill! pid))))))
+
+(deftest a-detached-holder-is-a-timeout-every-time
+  (with-temp-dir [dir]
+    (let [runs (with-delayed-threads #(rand-int 30)
+                 #(vec (repeatedly 15 (fn [] (detached-holder dir "" {:timeout-ms 200})))))]
+      (try
+        (is (= [[124 true]] (distinct (map (fn [[r]] [(:exit r) (:timed-out? r)]) runs))))
+        (is (every? (fn [[_ _ pid]] (gone-within? pid 5000)) runs))
+        (finally (run! (fn [[_ _ pid]] (kill! pid)) runs))))))
+
+(deftest a-detached-child-that-closed-the-output-does-not-delay-the-run
+  (with-temp-dir [dir]
+    (let [[r ms pid] (detached-holder dir ">/dev/null 2>&1" {:timeout-ms 10000})]
+      (try
+        (is (= {:exit 0 :timed-out? false} (select-keys r [:exit :timed-out?])))
         (is (< ms 5000) (str "took " ms " ms"))
         (finally (kill! pid))))))
+
+(deftest output-written-before-a-late-read-is-kept
+  (let [r (with-delayed-threads (constantly 200) #(process/run ["sh" "-c" "echo out; echo err >&2; exit 3"]))]
+    (is (= {:exit 3 :out "out\n" :err "err\n" :timed-out? false}
+           (select-keys r [:exit :out :err :timed-out?])))))
+
+(deftest a-run-without-output-pipes-answers-127
+  (with-redefs-fn {#'briko.process/make-fifos! (fn [_ _] "mkfifo could not run: missing")}
+    #(let [r (process/run ["true"])]
+       (is (= 127 (:exit r)))
+       (is (false? (:launched? r)))
+       (is (str/includes? (:err r) "could not create the output pipes")))))
+
+(deftest the-output-pipes-are-removed
+  (let [tmp (fs/path (System/getProperty "java.io.tmpdir"))
+        ours (fn [] (set (map str (fs/glob tmp "briko-process-*"))))
+        before (ours)]
+    (process/run ["echo" "x"])
+    (process/run ["briko-no-such-program-0f3a"])
+    (process/run ["sleep" "30"] {:timeout-ms 100})
+    (is (= before (ours)))))
 
 (deftest an-interrupted-wait-kills-the-tree-and-rethrows
   (with-temp-dir [dir]

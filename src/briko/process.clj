@@ -19,16 +19,24 @@
        SIGKILL first.
 
    The deadline covers the program and its output: a run is finished once
-   the program has exited and both of its output streams are closed, so a
-   background child that keeps stdout open cannot stall the caller past
-   the deadline. Descendants are sampled while the program runs, densely
-   at first and then every 500 ms, and on a timeout every sampled
-   descendant still alive is killed, also those whose parent already
-   exited. A descendant that is started and detached between two samples,
-   such as the background job of a shell that exits at once, is out of
-   reach, because Java cannot put the program in a process group of its
-   own. Such a run still answers at the deadline, 124 when the detached
-   process holds the output open, and leaves that process running.
+   the program has exited and every process holding its stdout or stderr
+   has closed it, so a background child that keeps stdout open answers
+   124 at the deadline, every time. The output travels through named pipes
+   in a private temporary directory, read by this process alone: Java's
+   own process pipes are closed by the JDK as soon as the program exits,
+   whatever a descendant still holds, which would turn the outcome into a
+   race between that exit and the reading thread. Creating the pipes needs
+   `mkfifo` on the PATH; a run that cannot create them answers exit 127
+   with :launched? false, as for a program that cannot be launched.
+
+   On a timeout the program is killed with SIGKILL, then every descendant
+   seen while it ran, then, where /proc exists, every process still
+   holding one of its output pipes, also one started and detached between
+   two samples. Descendants are sampled while the program runs, densely
+   at first and then every 500 ms. A descendant that was detached between
+   two samples and does not hold the output is out of reach, because Java
+   cannot put the program in a process group of its own; it neither
+   delays the run nor is killed by it.
 
    Output is captured up to a byte limit per stream. Past the limit the
    stream is still read, so the program never blocks on a full pipe, but
@@ -40,11 +48,14 @@
    misspelt :timeout-ms cannot fall back to the default unnoticed. A
    thread interrupted while it waits kills the tree and rethrows the
    InterruptedException with its interrupt flag set."
-  (:require [babashka.process :as process]
+  (:require [babashka.fs :as fs]
+            [babashka.process :as process]
             [clojure.string :as str])
-  (:import (java.io ByteArrayOutputStream File IOException InputStream OutputStream)
+  (:import (java.io ByteArrayOutputStream File FileInputStream IOException InputStream OutputStream
+                    RandomAccessFile)
            (java.nio.charset StandardCharsets)
-           (java.nio.file Path)
+           (java.nio.file Files Path)
+           (java.util List)
            (java.util.concurrent TimeUnit)))
 
 (set! *warn-on-reflection* true)
@@ -192,6 +203,80 @@
        (finally
          (try (.close stdin) (catch IOException _ nil)))))))
 
+(defn- remaining-ms
+  ^long [^long deadline]
+  (max 0 (quot (- deadline (System/nanoTime)) 1000000)))
+
+;; Output pipes
+
+(defn- make-fifos!
+  "Creates a named pipe, readable and writable by the owner only, at each
+   of paths with mkfifo, within the deadline. Returns nil, or the reason
+   it could not."
+  [paths deadline]
+  (try
+    (let [proc (.start (doto (ProcessBuilder. ^List (into ["mkfifo" "-m" "600"] paths))
+                         (.redirectErrorStream true)))]
+      (.close (.getOutputStream proc))
+      (if (.waitFor proc (max 1 (remaining-ms deadline)) TimeUnit/MILLISECONDS)
+        (when-not (zero? (.exitValue proc))
+          (str "mkfifo failed: " (str/trim (String. (.readAllBytes (.getInputStream proc)) StandardCharsets/UTF_8))))
+        (do (.destroyForcibly proc)
+            "mkfifo overran the deadline")))
+    (catch IOException e
+      (str "mkfifo could not run: " (ex-message e)))))
+
+(defn- open-reader
+  "Opens the read end of the named pipe at path. A writer must hold the
+   pipe already, or the open blocks until one arrives."
+  ^InputStream [^String path]
+  (FileInputStream. path))
+
+(defn- open-keeper
+  "Opens the named pipe at path for reading and writing, which does not
+   block. While it is open, the program's redirect can open the pipe for
+   writing and the reader can open it for reading, neither waiting for
+   the other, and the pipe cannot reach end of file before the reader
+   holds it."
+  ^RandomAccessFile [^String path]
+  (RandomAccessFile. path "rw"))
+
+(defn- close-quietly
+  [^java.io.Closeable c]
+  (when c
+    (try (.close c) (catch IOException _ nil))))
+
+(defn- output-holders
+  "The pids of other processes holding a file below dir open, read from
+   /proc; empty where /proc does not exist or a process's descriptors are
+   not ours to read."
+  [^String dir]
+  (let [self (.pid (java.lang.ProcessHandle/current))
+        prefix (str dir File/separator)]
+    (distinct
+     (for [^File proc-dir (or (.listFiles (File. "/proc")) [])
+           :let [pid (parse-long (.getName proc-dir))]
+           :when (and pid (not= pid self))
+           ^File fd (or (.listFiles (File. proc-dir "fd")) [])
+           :let [target (try (str (Files/readSymbolicLink (.toPath fd))) (catch Exception _ ""))]
+           :when (str/starts-with? target prefix)]
+       pid))))
+
+(defn- kill-holders!
+  "Kills every process holding a file below dir open with SIGKILL, looking
+   again while a round still found one, so a holder that forked before it
+   died is found too."
+  [dir]
+  (loop [rounds 5]
+    (let [pids (output-holders dir)]
+      (when (and (seq pids) (pos? rounds))
+        (doseq [pid pids]
+          (let [^java.util.Optional h (java.lang.ProcessHandle/of (long pid))]
+            (when (.isPresent h)
+              (.destroyForcibly ^java.lang.ProcessHandle (.get h)))))
+        (Thread/sleep 20)
+        (recur (dec rounds))))))
+
 ;; The process tree
 
 (defn- descendants-of
@@ -220,10 +305,6 @@
   "How long a timed-out run waits for the output its killed tree wrote."
   200)
 
-(defn- remaining-ms
-  ^long [^long deadline]
-  (max 0 (quot (- deadline (System/nanoTime)) 1000000)))
-
 (defn- await!
   "Waits until the program has exited and both output threads finished, or
    the deadline passed, sampling descendants with a growing interval.
@@ -251,14 +332,87 @@
   (String. (.toByteArray sink) StandardCharsets/UTF_8))
 
 (defn- launch-failure
-  [^Exception e]
+  [^String reason]
   {:exit 127
    :out ""
-   :err (str "could not run the program: " (or (ex-message e) (.getName (class e))))
+   :err reason
    :timed-out? false
    :launched? false
    :out-truncated? false
    :err-truncated? false})
+
+(defn- reason-of
+  ^String [^Exception e]
+  (or (ex-message e) (.getName (class e))))
+
+(defn- launch
+  "Starts the program with stdout, and stderr unless it is inherited,
+   redirected to the named pipes at paths, and opens their read ends.
+   Returns {:proc :readers}, or {:failure reason} when it did not start."
+  [argv {:keys [dir inherit-err?] :as opts} paths]
+  (let [keepers (mapv open-keeper paths)
+        started (try
+                  (process/process (cond-> {:cmd (vec argv)
+                                            :env (environment opts)
+                                            :shutdown nil
+                                            :out (File. ^String (first paths))
+                                            :err (if inherit-err? :inherit (File. ^String (second paths)))}
+                                     dir (assoc :dir (str dir))))
+                  (catch Exception e e))]
+    (if (instance? Exception started)
+      (do (run! close-quietly keepers)
+          {:failure (str "could not run the program: " (reason-of started))})
+      (let [^Process proc (:proc started)]
+        (try
+          {:proc proc :readers (mapv open-reader paths)}
+          (catch Exception e
+            (.destroyForcibly proc)
+            (throw e))
+          (finally
+            (run! close-quietly keepers)))))))
+
+(defn- run-with-pipes
+  [argv {:keys [in max-out-bytes max-err-bytes inherit-err?] :as opts} deadline ^String pipe-dir]
+  (let [paths (cond-> [(str pipe-dir File/separator "out")]
+                (not inherit-err?) (conj (str pipe-dir File/separator "err")))
+        failure (make-fifos! paths deadline)
+        {:keys [^Process proc readers] :as launched} (when-not failure (launch argv opts paths))]
+    (if-let [reason (or (some->> failure (str "could not create the output pipes: ")) (:failure launched))]
+      (launch-failure reason)
+      (let [out-sink (ByteArrayOutputStream.)
+            err-sink (ByteArrayOutputStream.)
+            out-dropped (volatile! false)
+            err-dropped (volatile! false)
+            seen (atom #{})
+            _ (feed! (.getOutputStream proc) in)
+            out-thread (drain! (first readers) out-sink max-out-bytes out-dropped)
+            err-thread (if inherit-err?
+                         (daemon! (fn []))
+                         (drain! (second readers) err-sink max-err-bytes err-dropped))
+            finished? (try
+                        (await! proc out-thread err-thread deadline seen)
+                        (catch InterruptedException e
+                          (kill-tree! proc seen)
+                          (kill-holders! pipe-dir)
+                          (.interrupt (Thread/currentThread))
+                          (throw e)))]
+        (when-not finished?
+          (kill-tree! proc seen)
+          (kill-holders! pipe-dir)
+          ;; The pipes close once the killed processes are gone; a short
+          ;; grace collects what they wrote before the deadline. A pipe a
+          ;; process out of reach still holds is abandoned to its daemon
+          ;; thread.
+          (let [grace (+ (System/nanoTime) (* 1000000 grace-ms))]
+            (.join out-thread (max 1 (remaining-ms grace)))
+            (.join err-thread (max 1 (remaining-ms grace)))))
+        {:exit (if finished? (.exitValue proc) 124)
+         :out (text out-sink)
+         :err (text err-sink)
+         :timed-out? (not finished?)
+         :launched? true
+         :out-truncated? @out-dropped
+         :err-truncated? @err-dropped}))))
 
 (defn run
   "Runs argv, a non-empty sequence of strings whose first element is the
@@ -269,47 +423,14 @@
   ([argv] (run argv nil))
   ([argv opts]
    (check-argv! argv)
-   (let [{:keys [timeout-ms dir in max-out-bytes max-err-bytes inherit-err?] :as opts} (options opts)
-         deadline (+ (System/nanoTime) (* 1000000 (long timeout-ms)))
-         started (try
-                   (process/process (cond-> {:cmd (vec argv)
-                                             :env (environment opts)
-                                             :shutdown nil}
-                                      dir (assoc :dir (str dir))
-                                      inherit-err? (assoc :err :inherit)))
-                   (catch Exception e e))]
-     (if (instance? Exception started)
-       (launch-failure started)
-       (let [^Process proc (:proc started)
-             out-sink (ByteArrayOutputStream.)
-             err-sink (ByteArrayOutputStream.)
-             out-dropped (volatile! false)
-             err-dropped (volatile! false)
-             seen (atom #{})
-             _ (feed! (.getOutputStream proc) in)
-             out-thread (drain! (.getInputStream proc) out-sink max-out-bytes out-dropped)
-             err-thread (if inherit-err?
-                          (daemon! (fn []))
-                          (drain! (.getErrorStream proc) err-sink max-err-bytes err-dropped))
-             finished? (try
-                         (await! proc out-thread err-thread deadline seen)
-                         (catch InterruptedException e
-                           (kill-tree! proc seen)
-                           (.interrupt (Thread/currentThread))
-                           (throw e)))]
-         (when-not finished?
-           (kill-tree! proc seen)
-           ;; The pipes close once the killed processes are gone; a short
-           ;; grace collects what they wrote before the deadline. A pipe a
-           ;; detached process still holds is abandoned to its daemon
-           ;; thread.
-           (let [grace (+ (System/nanoTime) (* 1000000 grace-ms))]
-             (.join out-thread (max 1 (remaining-ms grace)))
-             (.join err-thread (max 1 (remaining-ms grace)))))
-         {:exit (if finished? (.exitValue proc) 124)
-          :out (text out-sink)
-          :err (text err-sink)
-          :timed-out? (not finished?)
-          :launched? true
-          :out-truncated? @out-dropped
-          :err-truncated? @err-dropped})))))
+   (let [opts (options opts)
+         deadline (+ (System/nanoTime) (* 1000000 (long (:timeout-ms opts))))
+         pipe-dir (try
+                    (str (fs/real-path (fs/create-temp-dir {:prefix "briko-process-"})))
+                    (catch IOException e e))]
+     (if (instance? IOException pipe-dir)
+       (launch-failure (str "could not create the output pipes: " (reason-of pipe-dir)))
+       (try
+         (run-with-pipes argv opts deadline pipe-dir)
+         (finally
+           (try (fs/delete-tree pipe-dir) (catch IOException _ nil))))))))
