@@ -8,16 +8,27 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.7"}
         babashka/fs {:mvn/version "0.5.34"}
         babashka/process {:mvn/version "0.6.25"}}
+ ;; briko.mcp reads and writes JSON through cheshire, resolved when first
+ ;; used: babashka carries it and the JVM consumers declare it, so briko
+ ;; itself needs it only for its tests. The jackson-core pin keeps the
+ ;; resolution above GHSA-r7wm-3cxj-wff9 (patched in 2.21.4), which
+ ;; cheshire 6.2.1 would otherwise resolve below.
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
-                      org.clojure/test.check {:mvn/version "1.1.3"}}
+                      org.clojure/test.check {:mvn/version "1.1.3"}
+                      cheshire/cheshire {:mvn/version "6.2.1"}
+                      com.fasterxml.jackson.core/jackson-core {:mvn/version "2.23.0"}}
          :main-opts ["-m" "kaocha.runner"]}
   :dev {:extra-paths ["test" "dev"]
-        :extra-deps {org.clojure/test.check {:mvn/version "1.1.3"}}}
+        :extra-deps {org.clojure/test.check {:mvn/version "1.1.3"}
+                     cheshire/cheshire {:mvn/version "6.2.1"}
+                     com.fasterxml.jackson.core/jackson-core {:mvn/version "2.23.0"}}}
   :eastwood {:extra-paths ["test"]
              :extra-deps {jonase/eastwood {:mvn/version "1.4.3"}
-                          org.clojure/test.check {:mvn/version "1.1.3"}}
+                          org.clojure/test.check {:mvn/version "1.1.3"}
+                          cheshire/cheshire {:mvn/version "6.2.1"}
+                          com.fasterxml.jackson.core/jackson-core {:mvn/version "2.23.0"}}
              :main-opts ["-m" "eastwood.lint"
                          "{:source-paths [\"src\"] :test-paths [\"test\"]}"]}
   :splint {:extra-deps {io.github.noahtheduke/splint {:mvn/version "1.25.0"}}
