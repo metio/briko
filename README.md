@@ -189,6 +189,8 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 
 `:as {:file path}` streams a 2xx body into a staged file beside `path` and renames it over `path` once it is complete, within `:max-bytes` (which may then exceed 2 GiB) and the deadline, forced to disk first; a body over the limit, past the deadline or cut off removes the staged file and leaves `path` untouched, and another status returns a nil `:body` without writing. A HEAD answer is not held to `:max-bytes` by its stated Content-Length. `:connect-to {:host :port}` sends an https request to another address, such as a forwarded port, through a loopback CONNECT tunnel that lives for the one request, while SNI, the Host header and certificate verification use the URL's host; a redirect leaving the origin is then refused.
 
+`:as :lines` reads a 2xx body as UTF-8 lines while it arrives, ending at `\n` or `\r\n`, and hands each to `:on-line` on the reading thread, or collects them as `:body` without one; the answer carries `:lines-read`. A line over `:max-line-bytes` (1 MiB) is refused, or cut at a character boundary with `{:on-long-line :truncate}`; `:max-bytes` bounds the whole stream, and `:max-lines` ends it early with `{:truncated :max-lines}`. A stream still open when `:timeout-ms` ends answers with the lines read so far and `{:truncated :deadline}` instead of a refusal, the incomplete line dropped; this holds only for `:as :lines`. `:on-line` is not called after `request` returns, and a throwing `:on-line` stops the request with `::on-line-failed`, its exception left out because it may quote the line. Another status returns its body as text. `:idle-timeout-ms`, in every body mode, refuses with `::idle-timeout` a hop whose headers or next body bytes do not arrive within it, removing a staged file, so a long download can carry a generous total deadline without a stalled connection holding it.
+
 ```clojure
 (require '[briko.http :as http])
 
@@ -201,6 +203,9 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
                                 :max-bytes (* 4 1024 1024 1024) :max-redirects 5 :timeout-ms 600000})
 ;; => {:status 200 :headers {...} :body "/tmp/tool.tar.gz" :url "..."}
 (http/request :get "https://github.com/api/v3/user" {:connect-to {:host "127.0.0.1" :port 8443}})
+(http/request :get watch-url {:as :lines :on-line handle-event :max-lines 20000 :timeout-ms 15000})
+;; => {:status 200 :headers {...} :body nil :url "..." :lines-read 412 :truncated :deadline}
+(http/request :get release-url {:as {:file dest} :timeout-ms (* 4 60 60 1000) :idle-timeout-ms 60000})
 ```
 
 ## Cryptography
