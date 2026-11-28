@@ -29,7 +29,10 @@
    whatever a descendant still holds, which would turn the outcome into a
    race between that exit and the reading thread. Creating the pipes needs
    `mkfifo` on the PATH; a run that cannot create them answers exit 127
-   with :launched? false, as for a program that cannot be launched.
+   with :launched? false, as for a program that cannot be launched. On a
+   JVM with native access enabled for our code (for example
+   --enable-native-access=ALL-UNNAMED), they are created in this process
+   through mkfifo(3) instead, which saves starting a program per run.
 
    Stdout written to a file ({:out {:file path}}) travels through the same
    pipe and is copied into the file by this process, so a detached child
@@ -461,13 +464,32 @@
 
 ;; Output pipes
 
-(defn- make-fifos!
+(def ^:private mkfifo-program
+  "The program that creates the named pipes where they are not created
+   in this process."
+  "mkfifo")
+
+(def ^:private native-mkfifo
+  "A function creating one owner-only named pipe in this process, from
+   briko.mkfifo, or nil where that cannot be used without a warning or
+   at all: under babashka, on a JVM without native access enabled for
+   our code, and where the foreign function API is missing."
+  (delay
+    (when-not (System/getProperty "babashka.version")
+      (try
+        ((requiring-resolve 'briko.mkfifo/maker))
+        ;; A runtime without the foreign function API fails with an Error
+        ;; (a native image), and every failure means the program is used.
+        #_{:splint/disable [lint/catch-throwable]}
+        (catch Throwable _ nil)))))
+
+(defn- run-mkfifo!
   "Creates a named pipe, readable and writable by the owner only, at each
-   of paths with mkfifo, within the deadline. Returns nil, or the reason
-   it could not."
+   of paths with the mkfifo program, within the deadline. Returns nil, or
+   the reason it could not."
   [paths deadline]
   (try
-    (let [proc (.start (doto (ProcessBuilder. ^List (into ["mkfifo" "-m" "600"] paths))
+    (let [proc (.start (doto (ProcessBuilder. ^List (into [mkfifo-program "-m" "600"] paths))
                          (.redirectErrorStream true)))]
       (.close (.getOutputStream proc))
       (if (.waitFor proc (max 1 (remaining-ms deadline)) TimeUnit/MILLISECONDS)
@@ -477,6 +499,16 @@
             "mkfifo overran the deadline")))
     (catch IOException e
       (str "mkfifo could not run: " (ex-message e)))))
+
+(defn- make-fifos!
+  "Creates a named pipe, readable and writable by the owner only, at each
+   of paths, in this process where native-mkfifo is available and with
+   the mkfifo program within the deadline otherwise. Returns nil, or the
+   reason it could not."
+  [paths deadline]
+  (if-let [make! @native-mkfifo]
+    (some make! paths)
+    (run-mkfifo! paths deadline)))
 
 (defn- open-reader
   "Opens the read end of the named pipe at path. A writer must hold the
@@ -531,9 +563,59 @@
 
 ;; The process tree
 
+(def ^:private children-files?
+  "Whether Linux lists each task's children in /proc/<pid>/task/<tid>/children,
+   which it does when built with CONFIG_PROC_CHILDREN."
+  (delay
+    (let [pid (.pid (java.lang.ProcessHandle/current))]
+      (.isFile (File. (str "/proc/" pid "/task/" pid "/children"))))))
+
+(defn- child-pids
+  "The pids /proc lists as children of any thread of the process pid;
+   empty once it has exited. Throws an IOException when a thread's list
+   cannot be read."
+  [pid]
+  (into []
+        (comp (mapcat (fn [^File task]
+                        (-> (Files/readAllBytes (.toPath (File. task "children")))
+                            (String. StandardCharsets/US_ASCII)
+                            str/trim
+                            (str/split #" "))))
+              (keep parse-long))
+        (.listFiles (File. (str "/proc/" pid "/task")))))
+
+(defn- children-in-proc
+  "The live children of handle, from /proc. A pid is kept only when the
+   process now holding it names handle as its parent, so a pid reused
+   after its process exited is never taken for a child."
+  [^java.lang.ProcessHandle handle]
+  (keep (fn [pid]
+          (let [^java.util.Optional child (java.lang.ProcessHandle/of (long pid))]
+            (when (.isPresent child)
+              (let [^java.lang.ProcessHandle child (.get child)
+                    ^java.util.Optional parent (.parent child)]
+                (when (and (.isPresent parent) (= handle (.get parent)))
+                  child)))))
+        (child-pids (.pid handle))))
+
 (defn- descendants-of
+  "The program's live descendants. Where /proc lists children, walking the
+   program's own tree costs a few file reads per descendant;
+   ProcessHandle.descendants reads every process on the host, which takes
+   milliseconds per sample with hundreds of processes, and is used where
+   /proc lists no children or a list could not be read."
   [^Process proc]
-  (iterator-seq (.iterator (.descendants (.toHandle proc)))))
+  (or (when @children-files?
+        (try
+          (loop [found [] pending [(.toHandle proc)]]
+            (if-let [h (first pending)]
+              (let [children (children-in-proc h)]
+                (recur (into found children) (into (subvec pending 1) children)))
+              found))
+          ;; A thread that exited between listing and reading, or a list
+          ;; that cannot be read: this sample walks the process table.
+          (catch IOException _ nil)))
+      (iterator-seq (.iterator (.descendants (.toHandle proc))))))
 
 (defn- sample!
   "Adds the program's live descendants to seen, an atom holding a set of
@@ -594,9 +676,10 @@
    :deadline or :stopped.
 
    The first sample is taken only after the program ran for one interval:
-   walking the process table costs about 15 ms with 600 processes, more
-   than a short program takes, and the samples serve only to kill a tree
-   that outlives its deadline, which a program that has exited cannot."
+   the samples serve only to kill a tree that outlives its deadline or is
+   stopped, which a program that has exited cannot, and where /proc lists
+   no children a sample walks the whole process table, about 15 ms with
+   600 processes."
   [^Process proc ^Thread out-thread ^Thread err-thread deadline seen stopped?]
   (loop [interval 10]
     (let [left (remaining-ms deadline)
@@ -772,6 +855,9 @@
   ([argv] (run argv nil))
   ([argv opts]
    (check-argv! argv)
+   ;; Realized before the deadline is armed: the first call may load a
+   ;; namespace.
+   @native-mkfifo
    (let [opts (options opts)
          deadline (deadline-of (:timeout-ms opts))
          pipe-dir (try

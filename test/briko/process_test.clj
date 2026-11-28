@@ -669,3 +669,126 @@
       (is (= [:interrupted true] outcome))
       (is (gone-within? @pid 5000))
       (finally (some-> @pid kill!)))))
+
+;; Descendants detached after a sample
+
+(defn- descendant-pids
+  "The pids of pid's descendants, as the JDK walks them."
+  [pid]
+  (let [^Optional h (java.lang.ProcessHandle/of (long pid))]
+    (if (.isPresent h)
+      (set (map (fn [^java.lang.ProcessHandle d] (.pid d))
+                (iterator-seq (.iterator (.descendants ^java.lang.ProcessHandle (.get h))))))
+      #{})))
+
+(defn- orphaning-run
+  "Starts a program on a thread of its own whose child starts a grandchild
+   holding none of the output and exits 400 ms later, after the first
+   samples, which leaves the grandchild outside the program's tree. Waits
+   until it is. Returns {:thread :outcome :handle :self :orphan
+   :detached?}; the outcome is the result, or :interrupted."
+  [dir opts]
+  (let [self (fs/path dir "self")
+        orphan (fs/path dir "orphan")
+        script (str "echo $$ > " self "; "
+                    "sh -c 'sleep 300 </dev/null >/dev/null 2>&1 & echo $! > " orphan "; sleep 0.4' "
+                    "</dev/null >/dev/null 2>&1; "
+                    "sleep 300")
+        handle (promise)
+        outcome (promise)
+        t (Thread. ^Runnable
+           (fn []
+             (try
+               (deliver outcome (process/run ["sh" "-c" script]
+                                             (assoc opts :on-start (fn [h] (deliver handle h)))))
+               (catch InterruptedException _
+                 (deliver outcome :interrupted)))))]
+    (.start t)
+    (let [self-pid (read-pid self)
+          orphan-pid (read-pid orphan)
+          deadline (+ (System/currentTimeMillis) 5000)
+          detached? (loop []
+                      (cond
+                        (not (contains? (descendant-pids self-pid) orphan-pid)) true
+                        (> (System/currentTimeMillis) deadline) false
+                        :else (do (Thread/sleep 20) (recur))))]
+      {:thread t :outcome outcome :handle handle :self self-pid :orphan orphan-pid :detached? detached?})))
+
+(defn- orphan-killed-by
+  "Checks that ending an orphaning run with end!, a function of the run's
+   parts, kills the orphan, and that the run answered as expected?."
+  [opts end! expected?]
+  (with-temp-dir [dir]
+    (let [{:keys [outcome self orphan detached?] :as run} (orphaning-run dir opts)]
+      (try
+        (is detached? "the grandchild left the program's tree before the run ended")
+        (is (alive? orphan) "negative control: the orphan runs before the run ends")
+        (end! run)
+        (let [r (deref outcome 10000 :hung)]
+          (is (expected? r) (pr-str (if (map? r) (dissoc r :out :err) r))))
+        (is (gone-within? orphan 5000) (str "the orphan " orphan " survived"))
+        (finally (run! kill! [orphan self]))))))
+
+(deftest a-timeout-kills-a-descendant-detached-after-a-sample
+  (orphan-killed-by {:timeout-ms 1500}
+                    (fn [_])
+                    (fn [r] (and (map? r) (= 124 (:exit r)) (:timed-out? r)))))
+
+(deftest a-stop-kills-a-descendant-detached-after-a-sample
+  (orphan-killed-by {:timeout-ms :none}
+                    (fn [{:keys [handle]}] ((:stop (deref handle 5000 nil))))
+                    (fn [r] (and (map? r) (= 137 (:exit r)) (:stopped? r)))))
+
+(deftest an-interrupt-kills-a-descendant-detached-after-a-sample
+  (orphan-killed-by {:timeout-ms :none}
+                    (fn [{:keys [^Thread thread]}] (.interrupt thread))
+                    #{:interrupted}))
+
+(deftest descendants-are-sampled-without-children-lists
+  (testing "where /proc lists no children, the process table is walked"
+    (with-redefs-fn {#'briko.process/children-files? (delay false)}
+      #(orphan-killed-by {:timeout-ms 1500}
+                         (fn [_])
+                         (fn [r] (and (map? r) (= 124 (:exit r)))))))
+  (testing "a children list that cannot be read falls back to the process table"
+    (with-redefs-fn {#'briko.process/child-pids (fn [_] (throw (java.io.IOException. "unreadable")))}
+      #(orphan-killed-by {:timeout-ms 1500}
+                         (fn [_])
+                         (fn [r] (and (map? r) (= 124 (:exit r))))))))
+
+(defn- spawn
+  "Starts argv with java.lang.ProcessBuilder, outside briko.process."
+  ^Process [& argv]
+  (.start (ProcessBuilder. ^java.util.List (vec argv))))
+
+(deftest the-children-walk-finds-what-the-jdk-finds
+  (let [proc (spawn "sh" "-c" "sleep 30 & sh -c 'sleep 30 & sleep 30' & sleep 30")
+        pid (.pid proc)]
+    (try
+      ;; Three children of the program and two of the inner shell.
+      (loop [n 0]
+        (when (and (< (count (descendant-pids pid)) 5) (< n 250))
+          (Thread/sleep 20)
+          (recur (inc n))))
+      (is @@#'briko.process/children-files? "this host lists children in /proc")
+      (is (= 5 (count (descendant-pids pid))))
+      (is (= (descendant-pids pid)
+             (set (map (fn [^java.lang.ProcessHandle h] (.pid h)) (#'briko.process/descendants-of proc)))))
+      (finally
+        (run! kill! (descendant-pids pid))
+        (.destroyForcibly proc)))))
+
+(deftest a-listed-pid-whose-parent-differs-is-not-a-child
+  (let [proc (spawn "sleep" "30")
+        stranger (spawn "sleep" "30")]
+    (try
+      (with-redefs-fn {#'briko.process/child-pids (fn [_] [(.pid stranger)])}
+        #(is (empty? (#'briko.process/children-in-proc (.toHandle proc)))))
+      (testing "negative control: the same pid listed under its real parent is kept"
+        (with-redefs-fn {#'briko.process/child-pids (fn [_] [(.pid stranger)])}
+          #(is (= [(.pid stranger)]
+                  (map (fn [^java.lang.ProcessHandle h] (.pid h))
+                       (#'briko.process/children-in-proc (java.lang.ProcessHandle/current)))))))
+      (finally
+        (.destroyForcibly proc)
+        (.destroyForcibly stranger)))))

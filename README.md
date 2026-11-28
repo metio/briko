@@ -51,7 +51,7 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (json/write-string {:a [1]} {:indent 2 :key-separator ": " :indent-arrays? true}) ;; => "{\n  \"a\": [\n    1\n  ]\n}"
 ```
 
-- `briko.process` runs a program as an argv, never through a shell, within a deadline (60 s by default) and with stdout and stderr captured up to a byte limit (1 MiB and 64 KiB). It never throws for a program that cannot be started (exit 127) or that overruns its deadline (exit 124, after its process tree was killed). Its output travels through named pipes, so `mkfifo` must be on the PATH; a run that finds none answers 127.
+- `briko.process` runs a program as an argv, never through a shell, within a deadline (60 s by default) and with stdout and stderr captured up to a byte limit (1 MiB and 64 KiB). It never throws for a program that cannot be started (exit 127) or that overruns its deadline (exit 124, after its process tree was killed). Its output travels through named pipes, so `mkfifo` must be on the PATH; a run that finds none answers 127. On a JVM with native access enabled for briko (`--enable-native-access=ALL-UNNAMED`, Java 22 or later), the pipes are created in process through `mkfifo(3)` instead, which saves starting a program per run; without it the JVM would print a warning on the first call, so briko then uses the program.
 
 ```clojure
 (require '[briko.process :as process])
