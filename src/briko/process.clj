@@ -67,6 +67,15 @@
    :err-truncated? is set. Output is decoded as UTF-8, replacing malformed
    bytes; a tail that was cut starts at the first whole character.
 
+   `start` runs a program alongside the caller, such as an SSH tunnel or a
+   port-forward, through the same named pipes, and returns a handle:
+   `alive?`, `output` (the bounded end of each stream, or stdout in a
+   file), `wait-ready` (until a line of output matches a regex or a
+   loopback port accepts, within a deadline) and `close` (kills the tree
+   and every holder of the output, idempotent, returns the exit). Every
+   started program still running is stopped by one JVM shutdown hook
+   unless the caller opts out with :stop-on-exit? false.
+
    Invalid arguments are a programming error and throw an ex-info whose
    :type is in `refusal-types`; an unknown option is refused, so a
    misspelt :timeout-ms cannot fall back to the default unnoticed, and so
@@ -127,7 +136,7 @@
 
 (def refusal-types
   "Every :type a refusal carries."
-  #{::invalid-argv ::invalid-options ::on-start-failed})
+  #{::invalid-argv ::invalid-options ::on-start-failed ::invalid-handle ::exited-before-ready ::ready-timeout})
 
 (defn- refuse!
   [type message data]
@@ -179,7 +188,8 @@
    :out-keep [#{:head :tail} ":head or :tail"]
    :err-keep [#{:head :tail} ":head or :tail"]
    :inherit-err? [boolean? "a boolean"]
-   :on-start [(fn [f] (or (nil? f) (fn? f))) "nil or a function of one argument"]})
+   :on-start [(fn [f] (or (nil? f) (fn? f))) "nil or a function of one argument"]
+   :stop-on-exit? [boolean? "a boolean"]})
 
 (def ^:private contradictions
   "[option given, options it rules out, why], each refused when given
@@ -187,15 +197,18 @@
   [[:out #{:max-out-bytes :out-keep} "stdout written to a file is not captured"]
    [:inherit-err? #{:max-err-bytes :err-keep} "inherited stderr is not captured"]])
 
-(defn- options
-  [opts]
+(defn- checked-options
+  "opts merged over defaults, refused when an option is unknown to
+   defaults, invalid, or ruled out by another one given."
+  [opts defaults contradictions]
   (when-not (or (nil? opts) (map? opts))
     (refuse! ::invalid-options "the options must be a map" {}))
   (when-let [unknown (seq (remove (set (keys defaults)) (keys opts)))]
     (refuse! ::invalid-options (str "unknown options " (pr-str (vec unknown))) {:unknown (vec unknown)}))
   (let [given opts
         opts (merge defaults opts)]
-    (doseq [[k [valid? wanted]] option-checks]
+    (doseq [[k [valid? wanted]] option-checks
+            :when (contains? defaults k)]
       (when-not (valid? (get opts k))
         (refuse! ::invalid-options (str k " must be " wanted) {:option k})))
     (when-let [both (seq (filter (set (:unset-env opts)) (keys (:extra-env opts))))]
@@ -206,6 +219,10 @@
             :when (seq clash)]
       (refuse! ::invalid-options (str k " rules out " (pr-str (vec clash)) ": " why) {:option (first clash)}))
     opts))
+
+(defn- options
+  [opts]
+  (checked-options opts defaults contradictions))
 
 (defn- check-argv!
   [argv]
@@ -251,11 +268,16 @@
 ;; returned nor write into a file after `run` came back.
 
 (defn- locked-sink
-  [consume finish]
-  (let [lock (Object.)
-        open (volatile! true)]
-    {:consume (fn [buf n] (locking lock (and @open (consume buf n))))
-     :finish (fn [] (locking lock (vreset! open false) (finish)))}))
+  "A sink of consume and finish under one lock. With so-far, the sink also
+   answers :peek, so-far called under the lock: its part of the result
+   so far, without finishing."
+  ([consume finish] (locked-sink consume finish nil))
+  ([consume finish so-far]
+   (let [lock (Object.)
+         open (volatile! true)]
+     (cond-> {:consume (fn [buf n] (locking lock (and @open (consume buf n))))
+              :finish (fn [] (locking lock (vreset! open false) (finish)))}
+       so-far (assoc :peek (fn [] (locking lock (so-far))))))))
 
 (defn- head-sink
   "Keeps the first limit bytes."
@@ -299,7 +321,12 @@
   (let [sink (ByteArrayOutputStream.)
         limit (long limit)
         slack (max limit 8192)
-        total (volatile! 0)]
+        total (volatile! 0)
+        snapshot (fn []
+                   (let [dropped? (> (long @total) limit)
+                         kept (last-bytes (.toByteArray sink) limit)]
+                     {:bytes (if dropped? (from-whole-character kept) kept)
+                      :dropped? dropped?}))]
     (locked-sink
      (fn [^bytes buf n]
        (let [n (long n)]
@@ -318,11 +345,8 @@
                    (.reset sink)
                    (.write sink kept 0 (alength kept))))))
          true))
-     (fn []
-       (let [dropped? (> (long @total) limit)
-             kept (last-bytes (.toByteArray sink) limit)]
-         {:bytes (if dropped? (from-whole-character kept) kept)
-          :dropped? dropped?})))))
+     snapshot
+     snapshot)))
 
 (defn- capture-sink
   [keep limit]
@@ -351,7 +375,8 @@
            false)))
      (fn []
        (close!)
-       {:written @written :error @error}))))
+       {:written @written :error @error})
+     (fn [] {:written @written :error @error}))))
 
 ;; Streams
 
@@ -365,8 +390,9 @@
 
 (defn- drain!
   "Reads in to its end on a daemon thread, handing every chunk to the
-   sink's consume, until it answers false."
-  ^Thread [^InputStream in {:keys [consume]}]
+   sink's consume, until it answers false, then calls the sink's :eof, if
+   it has one."
+  ^Thread [^InputStream in {:keys [consume eof]}]
   (daemon!
    (fn []
      (let [buf (byte-array 8192)]
@@ -377,7 +403,8 @@
                (recur))))
          (catch IOException _ nil)
          (finally
-           (try (.close in) (catch IOException _ nil))))))))
+           (try (.close in) (catch IOException _ nil))
+           (when eof (eof))))))))
 
 (defn- feed!
   "Writes input to the program's stdin on a daemon thread and closes it. A
@@ -756,3 +783,452 @@
          (run-with-pipes argv opts deadline pipe-dir)
          (finally
            (try (fs/delete-tree pipe-dir) (catch IOException _ nil))))))))
+
+;; Started programs
+
+(def start-defaults
+  "The options `start` uses where the caller gives none.
+
+   - :extra-env, :unset-env, :dir, :in and :inherit-err? as for `run`.
+   - :out, where stdout goes: nil keeps its last bytes; {:file path}
+     writes it into the file at path, created owner-only or truncated,
+     and refused when path is a symbolic link or not a regular file.
+   - :max-out-bytes, the end of stdout kept: 64 KiB.
+   - :max-err-bytes, the end of stderr kept: 64 KiB.
+   - :stop-on-exit?, whether the program is stopped when the JVM shuts
+     down, also on SIGTERM or SIGHUP: true. With false the caller alone
+     decides when it ends, and it may outlive the JVM."
+  {:extra-env {}
+   :unset-env []
+   :dir nil
+   :in nil
+   :out nil
+   :max-out-bytes 65536
+   :max-err-bytes 65536
+   :inherit-err? false
+   :stop-on-exit? true})
+
+(def ^:private start-contradictions
+  [[:out #{:max-out-bytes} "stdout written to a file is not kept"]
+   [:inherit-err? #{:max-err-bytes} "inherited stderr is not kept"]])
+
+(def wait-ready-defaults
+  "The options `wait-ready` uses where the caller gives none.
+
+   - :pattern, a regex found in a line of the program's output, or :port,
+     a TCP port on the loopback interface that accepts a connection:
+     exactly one of them is required.
+   - :stream, the output :pattern is looked for in, :out or :err: :out.
+   - :host, the loopback address :port is tried on, \"127.0.0.1\" or
+     \"::1\": \"127.0.0.1\".
+   - :timeout-ms, the deadline in milliseconds: 30000. There is no
+     unbounded wait.
+   - :settle-ms, how long the program must still run once it became
+     ready: 0. A port can accept because another program bound it; a
+     program that exits on its own failed bind is told apart this way.
+   - :close-on-refusal?, whether a refused or interrupted wait closes
+     the program: true."
+  {:pattern nil
+   :port nil
+   :stream :out
+   :host "127.0.0.1"
+   :timeout-ms 30000
+   :settle-ms 0
+   :close-on-refusal? true})
+
+(def ^:private wait-ready-checks
+  {:pattern [(fn [x] (or (nil? x) (instance? java.util.regex.Pattern x))) "nil or a regex"]
+   :port [(fn [x] (or (nil? x) (and (int? x) (<= 1 (long x) 65535)))) "nil or an int from 1 to 65535"]
+   :stream [#{:out :err} ":out or :err"]
+   :host [#{"127.0.0.1" "::1"} "\"127.0.0.1\" or \"::1\""]
+   :timeout-ms [(fn [x] (and (int-at-most? Integer/MAX_VALUE x) (pos? (long x))))
+                "a positive int of at most Integer/MAX_VALUE milliseconds"]
+   :settle-ms [(partial int-at-most? Integer/MAX_VALUE) "an int from 0 to Integer/MAX_VALUE milliseconds"]
+   :close-on-refusal? [boolean? "a boolean"]})
+
+;; Lines, for ready patterns
+
+(def ^:private max-line-bytes
+  "The bytes of a line a ready pattern is matched against; the rest of a
+   longer line is not looked at."
+  4096)
+
+(def ^:private history-lines
+  "How many of a stream's latest lines a ready pattern is matched against
+   besides the lines that arrive while it waits."
+  64)
+
+(defn- line-log
+  []
+  {:lock (Object.)
+   :partial (ByteArrayOutputStream.)
+   :history (volatile! [])
+   :watchers (volatile! #{})})
+
+(defn- emit-line!
+  "Ends the partial line: keeps it in the history and hands it to every
+   watcher. Called under the log's lock."
+  [{:keys [^ByteArrayOutputStream partial history watchers]}]
+  (let [s (String. (.toByteArray partial) StandardCharsets/UTF_8)
+        line (if (str/ends-with? s "\r") (subs s 0 (dec (count s))) s)]
+    (.reset partial)
+    (vswap! history (fn [h] (let [h (conj h line)] (if (> (count h) history-lines) (vec (rest h)) h))))
+    (run! (fn [w] (w line)) @watchers)))
+
+(defn- feed-lines!
+  "Splits the n bytes of buf into lines. The bytes are searched for
+   newlines through an ISO-8859-1 string, one char per byte, so the search
+   is native on both runtimes; each line is decoded as UTF-8."
+  [{:keys [lock ^ByteArrayOutputStream partial] :as log} ^bytes buf n]
+  (let [n (long n)
+        s (String. buf 0 (int n) StandardCharsets/ISO_8859_1)
+        append! (fn [from to]
+                  (let [k (min (- (long to) (long from)) (max 0 (- (long max-line-bytes) (.size partial))))]
+                    (when (pos? k) (.write partial buf (int from) (int k)))))]
+    (locking lock
+      (loop [from 0]
+        (let [i (.indexOf s "\n" (int from))]
+          (if (neg? i)
+            (append! from n)
+            (do (append! from i)
+                (emit-line! log)
+                (recur (inc i)))))))))
+
+(defn- flush-line!
+  "Ends a last line without a newline at end of file."
+  [{:keys [lock ^ByteArrayOutputStream partial] :as log}]
+  (locking lock
+    (when (pos? (.size partial))
+      (emit-line! log))))
+
+(defn- watched
+  "sink, with every chunk also split into lines on log."
+  [sink log]
+  (assoc sink
+         :consume (fn [buf n] (feed-lines! log buf n) ((:consume sink) buf n))
+         :eof (fn [] (flush-line! log))))
+
+(defn- watch!
+  "Delivers matched once a line of log matches pattern, looking at the
+   history first. Returns a function that stops watching."
+  [{:keys [lock history watchers]} pattern matched]
+  (let [w (fn [line] (when (re-find pattern line) (deliver matched true)))]
+    (locking lock
+      (if (some (fn [line] (re-find pattern line)) @history)
+        (deliver matched true)
+        (vswap! watchers conj w)))
+    (fn [] (locking lock (vswap! watchers disj w)))))
+
+;; The registry of started programs
+
+(defonce ^:private registry
+  ;; id -> handle of every started program with :stop-on-exit? true that
+  ;; has neither been closed nor finished on its own.
+  (atom {}))
+
+(declare close)
+
+(defn- stop-all!
+  "Stops every registered program: kills them all first, so none waits
+   for another's grace, then closes each. What the shutdown hook runs."
+  []
+  (let [handles (vals @registry)]
+    (doseq [h handles]
+      #_{:splint/disable [lint/catch-throwable]}
+      (try ((::kill! h)) (catch Throwable _ nil)))
+    (doseq [h handles]
+      #_{:splint/disable [lint/catch-throwable]}
+      (try (close h) (catch Throwable _ nil)))))
+
+(defonce ^:private shutdown-hook
+  ;; One hook for every started program, registered on the first start
+  ;; that asks for it. SIGTERM and SIGHUP run shutdown hooks and halt the
+  ;; JVM without unwinding any thread, so no finally of the caller runs.
+  ;; The hook is a registered, unstarted Thread; it holds no reference
+  ;; that keeps the JVM running, and stop-all! is bounded by the kills and
+  ;; one grace per program.
+  (delay (let [t (Thread. ^Runnable (fn [] (stop-all!)) "briko.process shutdown")]
+           (.addShutdownHook (Runtime/getRuntime) t)
+           t)))
+
+;; Starting
+
+(defn- start-with-pipes
+  "Launches argv with its output on named pipes below pipe-dir. Returns
+   the parts of a started program, or {:failure reason}."
+  [argv {:keys [in inherit-err? max-err-bytes] :as opts} ^String pipe-dir]
+  (let [paths (cond-> [(str pipe-dir File/separator "out")]
+                (not inherit-err?) (conj (str pipe-dir File/separator "err")))
+        failure (make-fifos! paths (deadline-of setup-ms))
+        out-sink (when-not failure (stdout-sink (assoc opts :out-keep :tail)))
+        launched (when-not (or failure (:failure out-sink))
+                   (launch argv opts paths))]
+    (if-let [reason (or (some->> failure (str "could not create the output pipes: "))
+                        (:failure out-sink)
+                        (:failure launched))]
+      (do (when-let [finish (:finish out-sink)] (finish))
+          {:failure reason})
+      (let [^Process proc (:proc launched)
+            readers (:readers launched)
+            nothing (fn [] {:bytes (byte-array 0) :dropped? false})
+            err-sink (if inherit-err?
+                       (locked-sink (fn [_ _] true) nothing nothing)
+                       (tail-sink max-err-bytes))
+            out-log (line-log)
+            err-log (line-log)
+            out-sink (watched out-sink out-log)
+            err-sink (watched err-sink err-log)]
+        (feed! (.getOutputStream proc) in)
+        {:proc proc
+         :out-sink out-sink
+         :err-sink err-sink
+         :out-log out-log
+         :err-log err-log
+         :out-thread (drain! (first readers) out-sink)
+         :err-thread (if inherit-err?
+                       (daemon! (fn []))
+                       (drain! (second readers) err-sink))}))))
+
+(defn- output-of
+  [opts out err]
+  (dissoc (result 0 false opts out err) :exit :timed-out? :launched?))
+
+(defn- failed-handle
+  "The handle of a program that did not start: never alive, closed with
+   127, its reason in the stderr of `output`."
+  [reason opts]
+  (let [failure (launch-failure reason opts)]
+    {:pid nil
+     :launched? false
+     ::alive? (constantly false)
+     ::exit-value (constantly 127)
+     ::output (constantly (dissoc failure :exit :timed-out? :launched?))
+     ::watch (fn [_ _ _] (fn []))
+     ::kill! (constantly nil)
+     ::close! (constantly 127)}))
+
+(defn- started-handle
+  "The handle of a started program. One lock orders its states:
+   :running becomes :finished when the program exited and its output
+   closed, or :killed when close or the shutdown hook killed it; both end
+   in :closed once close collected what was left."
+  [{:keys [^Process proc out-sink err-sink out-log err-log ^Thread out-thread ^Thread err-thread]}
+   {:keys [stop-on-exit?] :as opts} pipe-dir]
+  (let [lock (Object.)
+        state (volatile! :running)
+        exit (volatile! nil)
+        seen (atom #{})
+        id (Object.)
+        finish-sinks! (fn [] ((:finish out-sink)) ((:finish err-sink)))
+        unregister! (fn [] (swap! registry dissoc id))
+        kill! (fn []
+                (locking lock
+                  (when (= :running @state)
+                    (vreset! state :killed)
+                    (kill-all! proc seen pipe-dir))))
+        close! (fn []
+                 (locking lock
+                   (when (= :running @state)
+                     (vreset! state :killed)
+                     (kill-all! proc seen pipe-dir))
+                   (when (= :killed @state)
+                     ;; The pipes close once the killed processes are
+                     ;; gone; a pipe a process out of reach still holds
+                     ;; is abandoned to its daemon thread, whose sink no
+                     ;; longer accepts bytes once finished.
+                     (let [grace (deadline-of grace-ms)]
+                       (.waitFor proc (max 1 (remaining-ms grace)) TimeUnit/MILLISECONDS)
+                       (.join out-thread (max 1 (remaining-ms grace)))
+                       (.join err-thread (max 1 (remaining-ms grace))))
+                     (vreset! exit (if (.isAlive proc) 137 (.exitValue proc)))
+                     (finish-sinks!)
+                     (unregister!))
+                   (vreset! state :closed)
+                   @exit))
+        monitor (fn []
+                  (try
+                    ;; Descendants are sampled while the program runs, so
+                    ;; a kill reaches children it detached since.
+                    (loop [interval 10]
+                      (when-not (.waitFor proc interval TimeUnit/MILLISECONDS)
+                        (sample! proc seen)
+                        (recur (min 1000 (* 2 interval)))))
+                    (.join out-thread)
+                    (.join err-thread)
+                    (locking lock
+                      (when (= :running @state)
+                        (vreset! exit (.exitValue proc))
+                        (finish-sinks!)
+                        (vreset! state :finished)
+                        (unregister!)))
+                    (catch InterruptedException _ nil)))
+        handle {:pid (.pid proc)
+                :launched? true
+                ::opts opts
+                ::alive? (fn [] (.isAlive proc))
+                ::exit-value (fn [] (when-not (.isAlive proc) (.exitValue proc)))
+                ::output (fn [] (output-of opts ((:peek out-sink)) ((:peek err-sink))))
+                ::watch (fn [stream pattern matched]
+                          (watch! (if (= :err stream) err-log out-log) pattern matched))
+                ::kill! kill!
+                ::close! close!}]
+    ;; Registered before the monitor starts, so a program that finishes at
+    ;; once is unregistered after it was registered, never before.
+    (when stop-on-exit?
+      @shutdown-hook
+      (swap! registry assoc id handle))
+    (daemon! monitor)
+    handle))
+
+(defn start
+  "Starts argv, a non-empty sequence of strings whose first element is
+   the program, to run alongside the caller, with the options in
+   `start-defaults`, and returns a handle {:pid :launched?} for `alive?`,
+   `output`, `wait-ready` and `close`.
+
+   The program runs without a deadline until it exits or `close` ends it;
+   with :stop-on-exit? true, the default, it is also stopped when the JVM
+   shuts down. Its output is read all the time, so it never blocks on a
+   full pipe, and only the last :max-out-bytes and :max-err-bytes are
+   kept. A program that cannot be launched, also for want of `mkfifo`,
+   gives a handle with :pid nil and :launched? false that is never alive,
+   whose `output` carries the reason in :err and whose `close` answers
+   127. Invalid arguments are refused as for `run`."
+  ([argv] (start argv nil))
+  ([argv opts]
+   (check-argv! argv)
+   (let [opts (checked-options opts start-defaults start-contradictions)
+         pipe-dir (try
+                    (str (fs/real-path (fs/create-temp-dir {:prefix "briko-process-"})))
+                    (catch IOException e e))]
+     (if (instance? IOException pipe-dir)
+       (failed-handle (str "could not create the output pipes: " (reason-of pipe-dir)) opts)
+       (let [parts (try
+                     (start-with-pipes argv opts pipe-dir)
+                     (finally
+                       ;; Both ends of every pipe are open now, so the
+                       ;; names can go: nothing is left on disk whatever
+                       ;; becomes of this JVM. /proc still names a removed
+                       ;; pipe by its old path, which the holder kill
+                       ;; relies on.
+                       (try (fs/delete-tree pipe-dir) (catch IOException _ nil))))]
+         (if-let [reason (:failure parts)]
+           (failed-handle reason opts)
+           (started-handle parts opts pipe-dir)))))))
+
+(defn- check-handle!
+  [h]
+  (when-not (and (map? h) (fn? (::close! h)))
+    (refuse! ::invalid-handle "not a handle returned by start" {})))
+
+(defn alive?
+  "Whether the started program is running."
+  [h]
+  (check-handle! h)
+  (boolean ((::alive? h))))
+
+(defn output
+  "What the started program wrote so far, kept as `start` was told:
+   {:out :err :out-truncated? :err-truncated?}, with :out nil and
+   :out-bytes and :out-error instead when stdout goes to a file. A set
+   :out-error means the file is incomplete. The truncated flags say the
+   stream was longer than its limit, so its start is gone."
+  [h]
+  (check-handle! h)
+  ((::output h)))
+
+(defn close
+  "Ends the started program: kills it, every descendant seen while it
+   ran and every process holding its output, waits a short grace for its
+   last output, and returns its exit: 137 after SIGKILL, its own exit when
+   it had exited before, 127 when it never started. Idempotent: a later
+   call returns the same exit and kills nothing."
+  [h]
+  (check-handle! h)
+  ((::close! h)))
+
+(defn- wait-options
+  [opts h]
+  (let [given opts
+        _ (when-not (or (nil? opts) (map? opts))
+            (refuse! ::invalid-options "the options must be a map" {}))
+        _ (when-let [unknown (seq (remove (set (keys wait-ready-defaults)) (keys opts)))]
+            (refuse! ::invalid-options (str "unknown options " (pr-str (vec unknown))) {:unknown (vec unknown)}))
+        opts (merge wait-ready-defaults opts)]
+    (doseq [[k [valid? wanted]] wait-ready-checks]
+      (when-not (valid? (get opts k))
+        (refuse! ::invalid-options (str k " must be " wanted) {:option k})))
+    (when-not (= 1 (count (filter some? [(:pattern opts) (:port opts)])))
+      (refuse! ::invalid-options "exactly one of :pattern and :port must be given" {:option :pattern}))
+    (when (and (:pattern opts) (contains? given :host))
+      (refuse! ::invalid-options ":pattern rules out [:host]: no port is tried" {:option :host}))
+    (when (and (:port opts) (contains? given :stream))
+      (refuse! ::invalid-options ":port rules out [:stream]: no output is watched" {:option :stream}))
+    (when (and (:pattern opts) (= :err (:stream opts)) (:launched? h) (:inherit-err? (::opts h)))
+      (refuse! ::invalid-options "stderr is inherited and cannot be watched" {:option :stream}))
+    opts))
+
+(defn- port-open?
+  [^String host port timeout-ms]
+  (try
+    (with-open [socket (java.net.Socket.)]
+      (.connect socket (java.net.InetSocketAddress. host (int port)) (int timeout-ms))
+      true)
+    (catch IOException _ false)))
+
+(defn wait-ready
+  "Waits until the started program is ready, with the options in
+   `wait-ready-defaults`, and returns the handle: until a line of its
+   output matches :pattern, or :port on the loopback interface accepts a
+   connection, and the program still runs :settle-ms later.
+
+   A pattern is matched against the lines that arrive while it waits and
+   the latest lines before, up to 64 per stream, each up to its first
+   4096 bytes; call it soon after `start`, before a chatty program pushes
+   its ready line out.
+
+   Refuses with ::exited-before-ready, whose data carries :exit, when the
+   program is not running, and with ::ready-timeout when the deadline
+   passes; with :close-on-refusal? true, the default, the program is
+   closed first. Neither message nor data carries the program's output;
+   `output` still holds it. An interrupted wait closes the program the
+   same way and rethrows the InterruptedException with the flag set."
+  ([h opts]
+   (check-handle! h)
+   (let [{:keys [pattern port stream host timeout-ms settle-ms close-on-refusal?]} (wait-options opts h)
+         deadline (deadline-of timeout-ms)
+         settle-ns (* 1000000 (long settle-ms))
+         matched (promise)
+         unwatch (when pattern ((::watch h) stream pattern matched))
+         ready? (fn []
+                  (if pattern
+                    (realized? matched)
+                    (port-open? host port (max 1 (min 200 (remaining-ms deadline))))))]
+     (try
+       (loop [ready-since nil]
+         (let [ready-since (or ready-since (when (ready?) (System/nanoTime)))]
+           (cond
+             (not ((::alive? h)))
+             (let [exit (if close-on-refusal? (close h) ((::exit-value h)))]
+               (refuse! ::exited-before-ready "the program is not running and was not ready" {:exit exit}))
+
+             (and ready-since (>= (- (System/nanoTime) (long ready-since)) settle-ns))
+             h
+
+             (zero? (remaining-ms deadline))
+             (do (when close-on-refusal? (close h))
+                 (refuse! ::ready-timeout (str "the program was not ready within " timeout-ms " ms")
+                          {:timeout-ms timeout-ms}))
+
+             :else
+             (let [step (max 1 (min 50 (remaining-ms deadline)))]
+               (if (and pattern (not ready-since))
+                 (deref matched step nil)
+                 (Thread/sleep step))
+               (recur ready-since)))))
+       (catch InterruptedException e
+         (when close-on-refusal? (close h))
+         (.interrupt (Thread/currentThread))
+         (throw e))
+       (finally
+         (when unwatch (unwatch)))))))
