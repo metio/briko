@@ -5,7 +5,10 @@
   (:require [babashka.fs :as fs]
             [briko.process :as process]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]])
+            [clojure.test :refer [deftest is testing]]
+            [clojure.test.check :as tc]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop])
   (:import (java.util Optional)))
 
 (defn- refusal
@@ -180,13 +183,22 @@
        (is (str/includes? (:err r) "could not create the output pipes")))))
 
 (deftest the-output-pipes-are-removed
-  (let [tmp (fs/path (System/getProperty "java.io.tmpdir"))
-        ours (fn [] (set (map str (fs/glob tmp "briko-process-*"))))
-        before (ours)]
-    (process/run ["echo" "x"])
-    (process/run ["briko-no-such-program-0f3a"])
-    (process/run ["sleep" "30"] {:timeout-ms 100})
-    (is (= before (ours)))))
+  ;; The directories each run used are recorded rather than globbed, so
+  ;; other processes creating directories with the same prefix cannot
+  ;; disturb the count.
+  (let [used (atom [])
+        run-with-pipes @#'briko.process/run-with-pipes]
+    (with-redefs-fn {#'briko.process/run-with-pipes (fn [argv opts deadline dir]
+                                                      (swap! used conj dir)
+                                                      (run-with-pipes argv opts deadline dir))}
+      (fn []
+        (process/run ["echo" "x"])
+        (process/run ["briko-no-such-program-0f3a"])
+        (process/run ["sleep" "30"] {:timeout-ms 100})
+        (with-temp-dir [dir]
+          (process/run ["printf" "x"] {:out {:file (fs/path dir "out")}}))))
+    (is (= 4 (count @used)))
+    (is (not-any? fs/exists? @used))))
 
 (deftest an-interrupted-wait-kills-the-tree-and-rethrows
   (with-temp-dir [dir]
@@ -266,7 +278,11 @@
                 {:extra-env {"A" 1}} {:extra-env {:a "1"}} {:extra-env {"A=B" "1"}} {:extra-env ["A" "1"]}
                 {:unset-env "HOME"} {:unset-env [:home]} {:unset-env {"A" "1"}}
                 {:extra-env {"A" "1"} :unset-env ["A"]}
-                {:dir 1} {:in 1} {:in [1]} {:max-out-bytes -1} {:max-err-bytes "1"} {:inherit-err? 1}]]
+                {:dir 1} {:in 1} {:in [1]} {:max-out-bytes -1} {:max-err-bytes "1"} {:inherit-err? 1}
+                {:timeout-ms nil} {:timeout-ms :never} {:timeout-ms "none"}
+                {:in :terminal} {:in {:file 1}} {:in {:file ""}} {:in {:path "x"}} {:in {:file "x" :mode :r}}
+                {:out "file"} {:out :file} {:out {:file ""}} {:out {:file "x" :append true}} {:out {:file "a\u0000b"}}
+                {:out-keep :middle} {:err-keep "tail"} {:out-keep nil}]]
     (is (= ::process/invalid-options (refusal #(process/run ["true"] opts))) (pr-str opts))))
 
 (deftest a-refusal-does-not-echo-the-argv
@@ -275,3 +291,233 @@
     (is false "expected a refusal")
     (catch clojure.lang.ExceptionInfo e
       (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) "dummy-private-value"))))))
+
+(deftest contradictory-options-are-refused
+  (doseq [opts [{:out {:file "x"} :max-out-bytes 10}
+                {:out {:file "x"} :out-keep :tail}
+                {:out {:file "x"} :out-keep :head}
+                {:inherit-err? true :err-keep :tail}
+                {:inherit-err? true :max-err-bytes 10}]]
+    (is (= ::process/invalid-options (refusal #(process/run ["true"] opts))) (pr-str opts)))
+  (testing "the same options for a captured stream are accepted"
+    (doseq [opts [{:out nil :max-out-bytes 10 :out-keep :tail}
+                  {:inherit-err? false :max-err-bytes 10 :err-keep :tail}
+                  {:inherit-err? true :max-out-bytes 10 :out-keep :tail}]]
+      (is (zero? (:exit (process/run ["true"] opts))) (pr-str opts)))))
+
+;; Deadlines
+
+(deftest a-run-without-a-deadline-lasts-as-long-as-the-program
+  (let [[r ms] (elapsed-ms #(process/run ["sh" "-c" "sleep 0.3; echo done"] {:timeout-ms :none}))]
+    (is (= {:exit 0 :out "done\n" :timed-out? false} (select-keys r [:exit :out :timed-out?])))
+    (is (>= ms 300))))
+
+(deftest a-run-without-a-deadline-waits-for-a-detached-holder
+  (with-temp-dir [dir]
+    (let [pid-file (fs/path dir "pid")
+          [r ms] (elapsed-ms #(process/run ["sh" "-c" (str "sleep 1 & echo $! > " pid-file)] {:timeout-ms :none}))]
+      (is (= {:exit 0 :timed-out? false} (select-keys r [:exit :timed-out?])))
+      (is (>= ms 900) (str "took " ms " ms"))
+      (is (gone-within? (read-pid pid-file) 2000) "the holder ended before the run returned, up to its reaping"))))
+
+(deftest an-interrupted-run-without-a-deadline-kills-the-tree
+  (with-temp-dir [dir]
+    (let [child (fs/path dir "child")
+          grandchild (fs/path dir "grandchild")
+          script (str "sleep 300 & echo $! > " child "; "
+                      "sh -c 'sleep 300 & echo $! > " grandchild "; wait' & "
+                      "wait")
+          outcome (promise)
+          t (Thread. ^Runnable
+             (fn []
+               (try
+                 (process/run ["sh" "-c" script] {:timeout-ms :none})
+                 (deliver outcome :returned)
+                 (catch InterruptedException _
+                   (deliver outcome :interrupted)))))]
+      (.start t)
+      (let [pids [(read-pid child) (read-pid grandchild)]]
+        (try
+          ;; Past the first samples, so the tree is known before the interrupt.
+          (Thread/sleep 100)
+          (.interrupt t)
+          (is (= :interrupted (deref outcome 10000 :hung)))
+          (doseq [pid pids]
+            (is (gone-within? pid 5000) (str "process " pid " survived the interrupt")))
+          (finally (run! kill! pids)))))))
+
+;; Keeping the end of a stream
+
+(defn- tail-of
+  "What tail-sink keeps of chunks, a sequence of byte vectors, with limit."
+  [limit chunks]
+  (let [{:keys [consume finish]} (#'briko.process/tail-sink limit)]
+    (doseq [c chunks]
+      (let [bs (byte-array (map unchecked-byte c))]
+        (consume bs (alength bs))))
+    (update (finish) :bytes vec)))
+
+(deftest the-tail-sink-keeps-the-last-bytes-at-every-boundary
+  (do
+    (is (= {:bytes [] :dropped? false} (tail-of 3 [])))
+    (is (= {:bytes [1 2] :dropped? false} (tail-of 3 [[1 2]])))
+    (is (= {:bytes [1 2 3] :dropped? false} (tail-of 3 [[1 2 3]])) "exactly the limit")
+    (is (= {:bytes [1 2 3] :dropped? false} (tail-of 3 [[1] [2] [3]])) "exactly the limit in pieces")
+    (is (= {:bytes [2 3 4] :dropped? true} (tail-of 3 [[1 2 3 4]])) "one past the limit")
+    (is (= {:bytes [2 3 4] :dropped? true} (tail-of 3 [[1 2 3] [4]])) "one past the limit in pieces")
+    (is (= {:bytes [7 8 9] :dropped? true} (tail-of 3 [[1 2] [3 4 5 6 7 8 9]])) "a chunk longer than the limit")
+    (is (= {:bytes [] :dropped? true} (tail-of 0 [[1]])) "a limit of zero")
+    (is (= {:bytes [] :dropped? false} (tail-of 0 [])))
+    (testing "many small chunks across the buffer being cut back"
+      (let [chunks (map vector (take 20000 (cycle (range 100))))]
+        (is (= {:bytes (vec (take-last 10 (map first chunks))) :dropped? true} (tail-of 10 chunks)))))))
+
+(deftest the-tail-sink-matches-the-end-of-the-stream
+  (let [prop (prop/for-all [limit gen/nat
+                            chunks (gen/vector (gen/vector (gen/choose 0 127)) 0 40)]
+               (let [all (vec (apply concat chunks))]
+                 (= {:bytes (vec (take-last limit all)) :dropped? (> (count all) limit)}
+                    (tail-of limit chunks))))]
+    (is (:pass? (tc/quick-check 300 prop)))))
+
+(deftest a-cut-tail-starts-at-a-whole-character
+  (is (= {:bytes [] :dropped? true} (tail-of 1 [[0x61 0xC3 0xA9]])) "half of é is dropped")
+  (is (= {:bytes [0xC3 0xA9] :dropped? true} (update (tail-of 2 [[0x61 0xC3 0xA9]]) :bytes (partial mapv #(bit-and (long %) 0xFF)))))
+  (is (= {:bytes [0xA9] :dropped? false} (update (tail-of 1 [[0xA9]]) :bytes (partial mapv #(bit-and (long %) 0xFF))))
+      "an uncut stream is kept as it is"))
+
+(deftest stderr-can-keep-its-end
+  (let [expected (str/join (map #(str % "\n") (range 1 20001)))
+        r (process/run ["sh" "-c" "seq 1 20000 >&2; exit 2"] {:err-keep :tail :max-err-bytes 20})]
+    (is (= 2 (:exit r)))
+    (is (= (subs expected (- (count expected) 20)) (:err r)))
+    (is (true? (:err-truncated? r))))
+  (testing "the head is still the default"
+    (let [r (process/run ["sh" "-c" "seq 1 20000 >&2"] {:max-err-bytes 8})]
+      (is (= "1\n2\n3\n4\n" (:err r))))))
+
+(deftest stdout-can-keep-its-end
+  (is (= {:out "abcde" :out-truncated? false}
+         (select-keys (process/run ["printf" "abcde"] {:out-keep :tail :max-out-bytes 5}) [:out :out-truncated?])))
+  (is (= {:out "bcde" :out-truncated? true}
+         (select-keys (process/run ["printf" "abcde"] {:out-keep :tail :max-out-bytes 4}) [:out :out-truncated?])))
+  (testing "a stream far longer than a pipe holds"
+    (let [r (process/run ["sh" "-c" "head -c 3000000 /dev/zero; printf end"] {:out-keep :tail :max-out-bytes 3})]
+      (is (= "end" (:out r)))
+      (is (true? (:out-truncated? r))))))
+
+;; Stdout into a file
+
+(defn- mode-of
+  [path]
+  (java.nio.file.attribute.PosixFilePermissions/toString
+   (java.nio.file.Files/getPosixFilePermissions (fs/path path) (into-array java.nio.file.LinkOption [java.nio.file.LinkOption/NOFOLLOW_LINKS]))))
+
+(deftest stdout-can-go-to-a-file
+  (with-temp-dir [dir]
+    (let [target (fs/path dir "out")
+          r (process/run ["sh" "-c" "head -c 5000000 /dev/zero; echo err >&2"] {:out {:file target}})]
+      (is (= {:exit 0 :out nil :err "err\n" :out-bytes 5000000 :out-error nil :out-truncated? false}
+             (select-keys r [:exit :out :err :out-bytes :out-error :out-truncated?])))
+      (is (= 5000000 (fs/size target)))
+      (is (= "rw-------" (mode-of target)) "created owner-only"))
+    (testing "an existing file is truncated and keeps its mode"
+      (let [target (fs/path dir "existing")]
+        (spit (str target) (str/join (repeat 100 "old")))
+        (fs/set-posix-file-permissions target "rw-r-----")
+        (is (zero? (:exit (process/run ["printf" "new"] {:out {:file (str target)}}))))
+        (is (= "new" (slurp (str target))))
+        (is (= "rw-r-----" (mode-of target)))))
+    (testing "a File is accepted"
+      (let [target (fs/file dir "as-file")]
+        (is (= 3 (:out-bytes (process/run ["printf" "abc"] {:out {:file target}}))))))))
+
+(deftest a-stdout-file-that-cannot-be-opened-answers-127
+  (with-temp-dir [dir]
+    (let [victim (fs/path dir "victim")
+          link (fs/path dir "link")
+          fifo (str (fs/path dir "fifo"))]
+      (spit (str victim) "keep")
+      (fs/create-sym-link link victim)
+      (is (zero? (:exit (process/run ["mkfifo" fifo]))))
+      (doseq [[what target] [["a symbolic link" link]
+                             ["a named pipe" fifo]
+                             ["a directory" dir]
+                             ["a missing parent directory" (fs/path dir "missing" "out")]]]
+        (testing what
+          (let [[r ms] (elapsed-ms #(process/run ["echo" "x"] {:out {:file target} :timeout-ms 5000}))]
+            (is (= {:exit 127 :launched? false :out nil :out-bytes 0} (select-keys r [:exit :launched? :out :out-bytes])))
+            (is (str/includes? (:err r) "stdout file"))
+            (is (< ms 3000)))))
+      (is (= "keep" (slurp (str victim))) "the link's target is untouched"))))
+
+(deftest a-detached-child-holding-a-stdout-file-is-a-timeout
+  (with-temp-dir [dir]
+    (let [target (fs/path dir "out")
+          [r ms pid] (detached-holder dir "" {:out {:file target}})]
+      (try
+        (is (= {:exit 124 :timed-out? true} (select-keys r [:exit :timed-out?])))
+        (is (< ms 5000) (str "took " ms " ms"))
+        (is (gone-within? pid 5000) (str "the detached process " pid " survived the timeout"))
+        (finally (kill! pid))))))
+
+(deftest a-file-sink-takes-nothing-once-finished
+  (with-temp-dir [dir]
+    (let [target (fs/path dir "out")
+          {:keys [consume finish]} (#'briko.process/file-sink (#'briko.process/open-output-file target))
+          bs (.getBytes "abc" "UTF-8")]
+      (is (true? (consume bs 3)))
+      (is (= {:written 3 :error nil} (finish)))
+      (is (false? (boolean (consume bs 3))))
+      (is (= "abc" (slurp (str target)))))))
+
+(defn- failing-stream
+  []
+  (proxy [java.io.OutputStream] []
+    (write
+      ([_] (throw (java.io.IOException. "No space left on device")))
+      ([_ _ _] (throw (java.io.IOException. "No space left on device"))))))
+
+(deftest a-failed-write-to-the-stdout-file-is-reported
+  (with-redefs-fn {#'briko.process/open-output-file (fn [_] (failing-stream))}
+    #(let [r (process/run ["head" "-c" "1000000" "/dev/zero"] {:out {:file "unused"}})]
+       (is (str/includes? (str (:out-error r)) "No space left on device"))
+       (is (zero? (:out-bytes r)))
+       (is (not (zero? (:exit r))) "the program's next write fails"))))
+
+;; Stdin from a file or the terminal
+
+(deftest stdin-can-come-from-a-file
+  (with-temp-dir [dir]
+    (let [source (fs/path dir "in")
+          fifo (str (fs/path dir "fifo"))]
+      (spit (str source) "from a file\n")
+      (is (= "from a file\n" (:out (process/run ["cat"] {:in {:file source}}))))
+      (is (= "from a file\n" (:out (process/run ["cat"] {:in {:file (str source)}}))))
+      (is (zero? (:exit (process/run ["mkfifo" fifo]))))
+      (doseq [[what target] [["a missing file" (fs/path dir "missing")]
+                             ["a directory" dir]
+                             ["a named pipe, which would block the launch" fifo]]]
+        (testing what
+          (let [[r ms] (elapsed-ms #(process/run ["cat"] {:in {:file target} :timeout-ms 5000}))]
+            (is (= {:exit 127 :launched? false} (select-keys r [:exit :launched?])))
+            (is (< ms 3000))))))))
+
+(deftest stdin-can-come-from-the-terminal
+  (testing "where there is no terminal"
+    (with-redefs-fn {#'briko.process/tty-path "/nonexistent/briko-tty"}
+      #(let [r (process/run ["cat"] {:in :tty})]
+         (is (= {:exit 127 :launched? false} (select-keys r [:exit :launched?])))
+         (is (str/includes? (:err r) "briko-tty")))))
+  (testing "the terminal's path is what the program reads"
+    (with-temp-dir [dir]
+      (let [fake (fs/path dir "tty")]
+        (spit (str fake) "typed")
+        (with-redefs-fn {#'briko.process/tty-path (str fake)}
+          #(is (= "typed" (:out (process/run ["cat"] {:in :tty}))))))))
+  (testing "the real terminal, or 127 where this process has none"
+    (let [has-tty? (try (.close (java.io.FileInputStream. "/dev/tty")) true (catch java.io.IOException _ false))
+          r (process/run ["sh" "-c" "test -t 0"] {:in :tty})]
+      (if has-tty?
+        (is (zero? (:exit r)))
+        (is (= 127 (:exit r)))))))

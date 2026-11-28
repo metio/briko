@@ -51,6 +51,14 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 ;;     :out-truncated? false :err-truncated? false}
 ```
 
+  Each relaxation of those defaults is an option the caller names. `:timeout-ms :none` runs without a deadline, for builds and clones; interrupting the waiting thread still kills the tree. `:err-keep :tail` (or `:out-keep :tail`) keeps the last bytes of a stream past its limit instead of the first, where a failed build writes its error. `:out {:file path}` writes stdout into a file, created owner-only or truncated, never through a symbolic link; it still travels through the pipe, so a detached child holding stdout makes the run 124 and nothing reaches the file after `run` returned, and the result carries `:out-bytes` and `:out-error` instead of `:out`. `:in {:file path}` reads stdin from a regular file and `:in :tty` from the controlling terminal, answering 127 where there is none. A limit or keep option for a stream that is not captured is refused.
+
+```clojure
+(process/run ["cargo" "build"] {:dir crate :timeout-ms :none :err-keep :tail})
+(process/run ["zstd" "--decompress" "--stdout" archive] {:out {:file target} :timeout-ms 600000})
+(process/run ["stty" "size"] {:in :tty})
+```
+
 - `briko.secret` resolves secrets named in configuration at the moment of use: `{:env "NAME"}`, `{:file "/path"}`, `{:credential "NAME"}` (systemd credentials) and `{:command ["pass" "show" "x"]}`. An unset variable, a missing file, an empty or blank value and a command that fails or overruns its deadline are refused; no refusal carries the secret or the command's output.
 
 ```clojure
