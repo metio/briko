@@ -3,8 +3,9 @@
 
 (ns briko.json-bench
   "Measures briko.json against cheshire on generated documents shaped
-   like kubectl, npm and GitHub output, and write-string on a map shaped
-   like tik's derivation cache. Prints one EDN map per case. Run it on
+   like kubectl, npm and GitHub output, and write-string, compact and
+   with krei's pretty layout, on a map shaped like tik's derivation
+   cache. Prints one EDN map per case. Run it on
    both runtimes:
 
      bb -cp src:test:dev -m briko.json-bench 50
@@ -71,5 +72,14 @@
                         :cheshire-median-ms (:median-ms c) :briko-median-ms (:median-ms b)
                         :briko-no-duplicate-walk-median-ms (:median-ms w)
                         :escape-hidden-median-ms (:median-ms e)
-                        :ratio (/ (Math/round (* 100.0 (/ (:median-ms b) (max 0.001 (:median-ms c))))) 100.0)})))
+                        :ratio (/ (Math/round (* 100.0 (/ (:median-ms b) (max 0.001 (:median-ms c))))) 100.0)}))
+      (let [printer {:indentation 2 :object-field-value-separator ": " :indent-arrays? true}
+            c (ms-per-run n #(cheshire/generate-string cache {:pretty printer}))
+            b (ms-per-run n #(json/write-string cache {:indent 2 :key-separator ": " :indent-arrays? true}))
+            r (ms-per-run n #(json/write-string cache {:indent 2 :key-separator ": " :indent-arrays? true
+                                                        :escape-hidden? false}))]
+        (prn (merge base {:case :write-pretty :doc :derivation-cache :keys (count cache)
+                          :cheshire-median-ms (:median-ms c) :briko-median-ms (:median-ms b)
+                          :briko-raw-median-ms (:median-ms r)
+                          :ratio (/ (Math/round (* 100.0 (/ (:median-ms b) (max 0.001 (:median-ms c))))) 100.0)}))))
     (shutdown-agents)))
