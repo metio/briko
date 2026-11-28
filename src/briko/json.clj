@@ -18,7 +18,8 @@
        Infinity has no JSON spelling;
      - an object that names one key twice, because two readers that keep
        different duplicates read different documents;
-     - anything after the one value, and no value at all;
+     - anything after the one value, and no value at all, unless
+       :one-value? false asks for every value of the text;
      - comments, single quotes, trailing commas, NaN, leading zeros and
        raw control characters inside strings.
 
@@ -66,12 +67,15 @@
      others strings) or a function of the key string.
    - :allow-duplicate-keys?, whether an object may name a key twice, the
      last one winning: false.
-   - :expect, a predicate the value must satisfy: none."
+   - :one-value?, whether the text holds exactly one value: true. With
+     false a read returns a vector of every value, as of JSON Lines.
+   - :expect, a predicate every value must satisfy: none."
   {:max-bytes 1048576
    :max-depth 64
    :max-number-chars 100
    :keys :string
    :allow-duplicate-keys? false
+   :one-value? true
    :expect nil})
 
 (def write-defaults
@@ -130,6 +134,7 @@
    :max-number-chars [(partial pos-int-below? Integer/MAX_VALUE) "a positive int"]
    :keys [keys-option? ":string, :keyword, a set of strings or a function"]
    :allow-duplicate-keys? [boolean? "a boolean"]
+   :one-value? [boolean? "a boolean"]
    :expect [(fn [p] (or (nil? p) (ifn? p))) "nil or a predicate"]
    :pretty? [boolean? "a boolean"]})
 
@@ -295,38 +300,53 @@
     (number? x) "a number"
     :else (str "a " (.getName (class x)))))
 
+(defn- read-values
+  "Every value of text, read up to the second one when only one is wanted."
+  [^String text {:keys [one-value? max-depth] :as opts}]
+  (let [parsed-seq (cheshire-fn 'cheshire.core/parsed-seq)
+        k (key-fn (:keys opts))]
+    (with-bindings {(factory-var) (factory opts)}
+      (try
+        (let [values (parsed-seq (StringReader. text) k)]
+          (if one-value?
+            (let [first-value (vec (take 1 values))]
+              ;; Asking for a second value makes the parser read past the
+              ;; first, so text after it is refused rather than dropped,
+              ;; whether it parses or not.
+              (when (and (seq first-value) (try (seq (rest values)) (catch Exception _ true)))
+                (refuse! ::trailing-value "the input holds text after its JSON value"))
+              first-value)
+            (vec values)))
+        (catch StackOverflowError e
+          (refuse! ::too-deep (format "the input nests too deep to read within %d levels" max-depth)
+                   {:limit max-depth} e))
+        (catch clojure.lang.ExceptionInfo e
+          (if (refusal? e) (throw e) (classify! e opts)))
+        (catch Exception e (classify! e opts))))))
+
+(defn- expect!
+  [expect value]
+  (when (and expect (not (expect value)))
+    (refuse! ::unexpected (str "the input holds " (describe value) ", which is not what was expected")
+             {:found (describe value)}))
+  value)
+
 (defn- read-text
-  [^String text opts]
+  [^String text {:keys [one-value? expect] :as opts}]
   (check-numbers! text opts)
-  (let [{:keys [expect]} opts
-        parsed-seq (cheshire-fn 'cheshire.core/parsed-seq)
-        k (key-fn (:keys opts))
-        value (with-bindings {(factory-var) (factory opts)}
-                (let [values (try
-                               (seq (parsed-seq (StringReader. text) k))
-                               (catch StackOverflowError e
-                                 (refuse! ::too-deep (format "the input nests too deep to read within %d levels"
-                                                             (:max-depth opts))
-                                          {:limit (:max-depth opts)} e))
-                               (catch Exception e (classify! e opts)))]
-                  (when-not values
-                    (refuse! ::no-value "the input holds no JSON value"))
-                  ;; Asking for a second value makes the parser read past
-                  ;; the first, so text after it is refused rather than
-                  ;; dropped, whether it parses or not.
-                  (when (try (seq (rest values)) (catch Exception _ true))
-                    (refuse! ::trailing-value "the input holds text after its JSON value"))
-                  (first values)))]
-    (when (and expect (not (expect value)))
-      (refuse! ::unexpected (str "the input holds " (describe value) ", which is not what was expected")
-               {:found (describe value)}))
-    value))
+  (let [values (read-values text opts)]
+    (if one-value?
+      (if (seq values)
+        (expect! expect (first values))
+        (refuse! ::no-value "the input holds no JSON value"))
+      (mapv (partial expect! expect) values))))
 
 ;; Entry points
 
 (defn parse-string
   "The JSON value text s holds, read within the bounds of opts (see
-   `defaults` for the keys). Throws an ex-info whose :type is in
+   `defaults` for the keys), or with :one-value? false a vector of every
+   value. Throws an ex-info whose :type is in
    `refusal-types` otherwise."
   ([s] (parse-string s nil))
   ([s opts]

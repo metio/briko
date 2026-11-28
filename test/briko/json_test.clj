@@ -85,6 +85,14 @@
   (testing "negative control: whitespace after the value is not text"
     (is (= [1] (json/parse-string "[1] \n\t\r ")))))
 
+(deftest every-value-is-read-when-asked
+  (is (= [{"a" 1} [2] 3] (json/parse-string "{\"a\":1}\n[2]\n3\n" {:one-value? false})))
+  (is (= [] (json/parse-string " " {:one-value? false})))
+  (is (= ::json/malformed (refused "{\"a\":1}\n[2" {:one-value? false})) "a truncated last value")
+  (is (= ::json/duplicate-key (refused "{}\n{\"a\":1,\"a\":2}" {:one-value? false})))
+  (is (= ::json/unexpected (refused "{}\n[]" {:one-value? false :expect map?})) "every value meets :expect")
+  (is (= [{:a 1}] (json/parse-string "{\"a\":1}" {:one-value? false :keys :keyword}))))
+
 (deftest no-value-is-refused
   (is (= ::json/no-value (refused "")))
   (is (= ::json/no-value (refused " \n ")))
@@ -137,7 +145,7 @@
   (is (= ::json/invalid-options (refused "1" {:pretty? true})) "a write option is unknown to a read")
   (is (= ::json/invalid-options (refused "1" [:max-bytes 1])))
   (doseq [[k v] [[:max-bytes 0] [:max-bytes Integer/MAX_VALUE] [:max-depth -1] [:max-number-chars 1.5]
-                 [:keys :symbol] [:keys #{:a}] [:allow-duplicate-keys? nil] [:expect "x"]]]
+                 [:keys :symbol] [:keys #{:a}] [:allow-duplicate-keys? nil] [:one-value? "yes"] [:expect "x"]]]
     (is (= ::json/invalid-options (refused "1" {k v})) (pr-str [k v])))
   (is (= ::json/invalid-options (refusal #(json/write-string 1 {:max-bytes 1}))))
   (is (= ::json/invalid-options (refusal #(json/write-string 1 {:pretty? 1})))))
