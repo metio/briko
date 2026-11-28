@@ -13,5 +13,6 @@
            briko.digest-test/with-temp-dir clojure.core/fn
            briko.inventory-test/with-temp-dir clojure.core/fn
            briko.http-file-test/with-temp-dir clojure.core/fn
+           briko.http-idle-test/with-temp-dir clojure.core/fn
            ;; (with-server [s (start! …)] body) binds s like let
            briko.http-fixture/with-server clojure.core/let}}

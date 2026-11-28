@@ -52,6 +52,31 @@
    deadline or cut off by the server removes the staged file and leaves
    path as it was. :body is then the path written.
 
+   With :as :lines the body is read as UTF-8 lines while it arrives, each
+   handed to :on-line on the thread reading the body, or collected into a
+   vector as :body without one. A line ends at \n or \r\n, which is not part
+   of it; the text after the last line end is a last line once the body
+   ends. A line longer than :max-line-bytes is refused, or cut to that many
+   bytes at a character boundary with {:on-long-line :truncate}. :max-bytes
+   bounds the whole body, :max-lines the number of lines: the nth line
+   stops the request and it answers with {:truncated :max-lines}. The
+   answer carries :lines-read, the lines handed over. This is the one mode
+   in which the deadline is not a refusal: a stream still open when
+   :timeout-ms ends answers with the lines read so far and {:truncated
+   :deadline}, the incomplete line dropped. :on-line is never called after
+   `request` returns, unless a call running at the deadline outlasts a
+   grace of 10 s; it is then interrupted. A throwing :on-line stops the
+   request, which is refused with ::on-line-failed; the exception is not
+   kept, since it may quote the line. Only a 2xx answer is read as lines;
+   any other status comes back with its body as text, as with :as :text.
+
+   :idle-timeout-ms bounds the silence of a transfer in every body mode:
+   each hop must receive its response headers within it, and the body
+   must deliver a byte at least that often. A transfer that stalls longer
+   is refused with ::idle-timeout, also with :as :lines, and in file mode
+   the staged file is removed. A long download can then carry a generous
+   :timeout-ms without a stalled connection holding it for that long.
+
    A HEAD request is answered without a body, so the Content-Length it
    states is the size of the resource and is not held to :max-bytes.
 
@@ -90,6 +115,8 @@
            (java.security.cert CertificateFactory)
            (java.time Duration)
            (java.util Optional)
+           (java.util.concurrent Semaphore TimeUnit)
+           (java.util.concurrent.atomic AtomicLong)
            (javax.net.ssl SSLContext TrustManagerFactory)))
 
 (set! *warn-on-reflection* true)
@@ -103,11 +130,21 @@
    - :body, a string (sent as UTF-8) or a byte array: none. Refused for
      :get and :head.
    - :as, the type of the response body: :bytes, :text for a string
-     decoded as UTF-8, malformed bytes replaced, or {:file path} to stream
-     a 2xx body to the file at path, whose directory must exist. The map
-     may add :fsync? (true), whether the file reaches the disk before the
-     rename, and :on-progress, a function called with the bytes written
-     so far and the stated length or nil, on the thread reading the body.
+     decoded as UTF-8, malformed bytes replaced, :lines for a 2xx body
+     read line by line, or {:file path} to stream a 2xx body to the file
+     at path, whose directory must exist. The map may add :fsync? (true),
+     whether the file reaches the disk before the rename, and
+     :on-progress, a function called with the bytes written so far and
+     the stated length or nil, on the thread reading the body.
+   - :on-line, with :as :lines, a function called with each line as a
+     string: none, the lines are collected as :body.
+   - :max-line-bytes, with :as :lines, the longest line in bytes without
+     its line end: 1 MiB.
+   - :on-long-line, with :as :lines, what a longer line does: :refuse,
+     or :truncate to cut it to :max-line-bytes.
+   - :max-lines, with :as :lines, the most lines to read: none.
+   - :idle-timeout-ms, the longest wait for the response headers and
+     between two reads of the body that deliver bytes: none.
    - :connect-timeout-ms, the longest wait for a connection: 10 s.
    - :timeout-ms, the longest wait for the whole request: 60 s.
    - :max-bytes, the largest response body: 16 MiB. A body held in
@@ -132,13 +169,19 @@
    :allow-redirect? nil
    :allow-insecure-http? false
    :ssl-context nil
-   :connect-to nil})
+   :connect-to nil
+   :on-line nil
+   :max-line-bytes 1048576
+   :on-long-line :refuse
+   :max-lines nil
+   :idle-timeout-ms nil})
 
 (def refusal-types
   "Every :type a refusal carries."
   #{::invalid-options ::invalid-url ::insecure-url ::invalid-header ::invalid-trust
     ::connect-failed ::connect-timeout ::tls-failed ::timeout ::too-large
-    ::too-many-redirects ::redirect-refused ::file-failed ::failed ::interrupted})
+    ::too-many-redirects ::redirect-refused ::file-failed ::failed ::interrupted
+    ::idle-timeout ::line-too-long ::on-line-failed})
 
 (defn- refuse!
   ([type message] (refuse! type message {} nil))
@@ -325,8 +368,8 @@
            (<= 1 (long (:port c)) 65535))))
 
 (def ^:private option-checks
-  {:as [(fn [as] (or (contains? #{:bytes :text} as) (file-sink? as)))
-        "one of :bytes and :text, or {:file path} with optional :fsync? and :on-progress"]
+  {:as [(fn [as] (or (contains? #{:bytes :text :lines} as) (file-sink? as)))
+        "one of :bytes, :text and :lines, or {:file path} with optional :fsync? and :on-progress"]
    :connect-timeout-ms [(partial pos-int-below? Integer/MAX_VALUE) "a positive int"]
    :timeout-ms [(partial pos-int-below? Integer/MAX_VALUE) "a positive int"]
    :max-bytes [(partial pos-int-below? Long/MAX_VALUE) "a positive int"]
@@ -336,7 +379,15 @@
    :ssl-context [(fn [c] (or (nil? c) (instance? SSLContext c))) "nil or a javax.net.ssl.SSLContext"]
    :query [(fn [q] (or (nil? q) (map? q))) "nil or a map"]
    :body [(fn [b] (or (nil? b) (string? b) (bytes? b))) "nil, a string or a byte array"]
-   :connect-to [connect-to? "nil or {:host :port} with a host name or IP address and a port from 1 to 65535"]})
+   :connect-to [connect-to? "nil or {:host :port} with a host name or IP address and a port from 1 to 65535"]
+   :on-line [(fn [f] (or (nil? f) (ifn? f))) "nil or a function"]
+   :max-line-bytes [(partial pos-int-below? (- Integer/MAX_VALUE 8)) "a positive int"]
+   :on-long-line [#{:refuse :truncate} "one of :refuse and :truncate"]
+   :max-lines [(fn [n] (or (nil? n) (pos-int-below? Long/MAX_VALUE n))) "nil or a positive int"]
+   :idle-timeout-ms [(fn [n] (or (nil? n) (pos-int-below? Integer/MAX_VALUE n))) "nil or a positive int"]})
+
+(def ^:private line-options
+  #{:on-line :max-line-bytes :on-long-line :max-lines})
 
 (defn- options
   [method opts]
@@ -347,7 +398,8 @@
     (refuse! ::invalid-options "the options must be a map" {}))
   (when-let [unknown (seq (remove (set (keys defaults)) (keys opts)))]
     (refuse! ::invalid-options (str "unknown options " (pr-str (vec unknown))) {:unknown (vec unknown)}))
-  (let [opts (merge defaults opts)]
+  (let [raw opts
+        opts (merge defaults opts)]
     (doseq [[k [valid? wanted]] option-checks]
       (when-not (valid? (get opts k))
         (refuse! ::invalid-options (str k " must be " wanted) {:option k})))
@@ -359,6 +411,10 @@
                {:option :max-bytes}))
     (when (and (= :head method) (file-sink? (:as opts)))
       (refuse! ::invalid-options "a HEAD request has no body to write to a file" {:option :as}))
+    (when (and (= :head method) (= :lines (:as opts)))
+      (refuse! ::invalid-options "a HEAD request has no body to read as lines" {:option :as}))
+    (when-let [k (and (not= :lines (:as opts)) (first (sort (filter line-options (keys raw)))))]
+      (refuse! ::invalid-options (str k " applies only to :as :lines") {:option k}))
     opts))
 
 (defn trust-context
@@ -395,6 +451,45 @@
   (refuse! ::timeout (format "the request did not complete within %d ms" timeout-ms)
            {:url (redacted uri) :limit timeout-ms}))
 
+(defn- idle-timed-out!
+  ([^URI uri idle-timeout-ms] (idle-timed-out! uri idle-timeout-ms nil))
+  ([^URI uri idle-timeout-ms cause]
+   (refuse! ::idle-timeout (format "no bytes arrived for %d ms" idle-timeout-ms)
+            {:url (redacted uri) :limit idle-timeout-ms} cause)))
+
+(defn- hop-timeout-ms
+  "How long one hop may wait for its response headers: the time left
+   before the deadline, or the idle timeout when that is shorter."
+  ^long [^long remaining idle-timeout-ms]
+  (if idle-timeout-ms (min remaining (long idle-timeout-ms)) remaining))
+
+(defn- idle-first?
+  "Whether a hop that had remaining ms left was cut off by the idle
+   timeout rather than the deadline."
+  [remaining idle-timeout-ms]
+  (boolean (and remaining idle-timeout-ms (< (long idle-timeout-ms) (long remaining)))))
+
+(defn- await-reader
+  "The value of the future reading, or ::timed-out once the deadline
+   passes, or ::idle once progress, the System/nanoTime of the last read
+   that delivered bytes, lies idle-timeout-ms back. Whichever bound
+   expires first wins."
+  [reading ^AtomicLong progress ^long deadline idle-timeout-ms]
+  (loop []
+    (if (realized? reading)
+      @reading
+      (let [now (System/nanoTime)
+            idle-at (when idle-timeout-ms (+ (.get progress) (* 1000000 (long idle-timeout-ms))))
+            first-at (if idle-at (min (long idle-at) deadline) deadline)]
+        (if (<= first-at now)
+          (if (and idle-at (<= (long idle-at) deadline)) ::idle ::timed-out)
+          (let [r (deref reading (max 1 (quot (+ (- first-at now) 999999) 1000000)) ::waiting)]
+            (if (= ::waiting r) (recur) r)))))))
+
+(defn- touch!
+  [^AtomicLong progress]
+  (.set progress (System/nanoTime)))
+
 ;; Sending
 
 (defn- client
@@ -422,7 +517,7 @@
 (defn- send-failure!
   "Refuses the exception e that sending to uri threw, by what it says
    about the connection. JDK messages carry no request headers."
-  [^Throwable e ^URI uri {:keys [connect-timeout-ms timeout-ms remaining tunnel-failure]}]
+  [^Throwable e ^URI uri {:keys [connect-timeout-ms timeout-ms idle-timeout-ms remaining tunnel-failure]}]
   (let [chain (causes e)
         data {:url (redacted uri)}]
     (cond
@@ -445,9 +540,16 @@
       ;; so there it is always the deadline.
       (and (some (partial class-named? "java.net.http.HttpConnectTimeoutException") chain)
            (nil? tunnel-failure)
-           (or (nil? remaining) (< (long connect-timeout-ms) (long remaining))))
+           (or (nil? remaining)
+               (< (long connect-timeout-ms) (hop-timeout-ms remaining idle-timeout-ms))))
       (refuse! ::connect-timeout (format "connecting took longer than %d ms" connect-timeout-ms)
                (assoc data :limit connect-timeout-ms) e)
+
+      ;; the request timeout of a hop is the idle timeout when that is
+      ;; shorter than the time left
+      (and (some #(instance? HttpTimeoutException %) chain)
+           (idle-first? remaining idle-timeout-ms))
+      (idle-timed-out! uri idle-timeout-ms e)
 
       (some #(instance? HttpTimeoutException %) chain)
       (refuse! ::timeout (format "the request did not complete within %d ms" timeout-ms)
@@ -482,7 +584,7 @@
   (let [remaining (remaining-ms deadline)]
     (when-not (pos? remaining)
       (timed-out! uri (:timeout-ms opts)))
-    (let [req (try (http-request uri method headers body remaining)
+    (let [req (try (http-request uri method headers body (hop-timeout-ms remaining (:idle-timeout-ms opts)))
                    (catch IllegalArgumentException _
                      ;; the client's own header checks; their message quotes
                      ;; the value, so it is not kept as the cause
@@ -507,9 +609,10 @@
   (try (.close c) (catch Exception _ nil)))
 
 (defn- read-limited
-  "Reads in to its end, keeping at most max-bytes. Returns {:bytes b},
-   {:too-large true} or {:error e}."
-  [^InputStream in max-bytes]
+  "Reads in to its end, keeping at most max-bytes and touching progress
+   after every read that delivers bytes. Returns {:bytes b}, {:too-large
+   true} or {:error e}."
+  [^InputStream in max-bytes ^AtomicLong progress]
   (try
     (let [out (ByteArrayOutputStream.)
           buffer (byte-array 8192)]
@@ -518,7 +621,7 @@
           (cond
             (neg? n) {:bytes (.toByteArray out)}
             (< (long max-bytes) (+ (.size out) n)) {:too-large true}
-            :else (do (.write out buffer 0 n) (recur))))))
+            :else (do (touch! progress) (.write out buffer 0 n) (recur))))))
     (catch Exception e {:error e})))
 
 (defn- too-large!
@@ -546,11 +649,12 @@
   "The body of resp as bytes, within max-bytes and the deadline. The read
    runs on a thread of its own so that a server trickling the body is cut
    off at the deadline; the stream is closed whatever happens."
-  ^bytes [^HttpResponse resp ^URI uri method deadline {:keys [max-bytes timeout-ms]}]
+  ^bytes [^HttpResponse resp ^URI uri method deadline {:keys [max-bytes timeout-ms idle-timeout-ms]}]
   (let [^InputStream in (.body resp)]
     (check-declared! resp uri method max-bytes)
-    (let [reading (future (read-limited in max-bytes))
-          result (try (deref reading (max 0 (remaining-ms deadline)) ::timed-out)
+    (let [progress (AtomicLong. (System/nanoTime))
+          reading (future (read-limited in max-bytes progress))
+          result (try (await-reader reading progress deadline idle-timeout-ms)
                       (catch InterruptedException e
                         (.interrupt (Thread/currentThread))
                         (refuse! ::interrupted "interrupted while reading the response" {:url (redacted uri)} e))
@@ -559,6 +663,7 @@
                         (close-quietly in)))]
       (cond
         (= ::timed-out result) (timed-out! uri timeout-ms)
+        (= ::idle result) (idle-timed-out! uri idle-timeout-ms)
         (:too-large result) (too-large! uri max-bytes)
         (:error result) (send-failure! (:error result) uri {:timeout-ms timeout-ms})
         :else (:bytes result)))))
@@ -581,7 +686,7 @@
    body-read once the body ended. A failed read is wrapped in an ex-info,
    which briko.fs passes through unchanged, so that it is told apart from
    a failed write."
-  [^InputStream in ^FileChannel channel max-bytes declared on-progress body-read]
+  [^InputStream in ^FileChannel channel max-bytes declared on-progress body-read ^AtomicLong progress]
   (let [buffer (byte-array 65536)]
     (loop [written 0]
       (let [n (long (try (.read in buffer)
@@ -592,6 +697,7 @@
           (let [total (+ written n)]
             (when (< (long max-bytes) total)
               (throw (ex-info "the body is too large" {::too-large true})))
+            (touch! progress)
             (write-all! channel buffer n)
             (when on-progress
               (on-progress total (when (<= 0 (long declared)) declared)))
@@ -618,24 +724,25 @@
    that thread, which this function waits for. Once the whole body has
    arrived, the force to disk and the rename are waited for even past the
    deadline, since the file may already be in place."
-  [^HttpResponse resp ^URI uri deadline {:keys [max-bytes timeout-ms as]}]
+  [^HttpResponse resp ^URI uri deadline {:keys [max-bytes timeout-ms idle-timeout-ms as]}]
   (let [^InputStream in (.body resp)
         {:keys [file fsync? on-progress] :or {fsync? true}} as
         declared (declared-length resp)
+        progress (AtomicLong. (System/nanoTime))
         body-read (promise)
         finished (promise)
         writing (future
                   (try
                     {:path (bfs/atomic-write! file
                                               (fn [channel]
-                                                (copy-limited! in channel max-bytes declared on-progress body-read))
+                                                (copy-limited! in channel max-bytes declared on-progress body-read progress))
                                               {:fsync? fsync?})}
                     #_{:splint/disable [lint/catch-throwable]}
                     (catch Throwable e {:error e})
                     (finally (deliver finished true))))
         result (try
-                 (let [r (deref writing (max 0 (remaining-ms deadline)) ::timed-out)]
-                   (if (and (= ::timed-out r) (realized? body-read))
+                 (let [r (await-reader writing progress deadline idle-timeout-ms)]
+                   (if (and (#{::timed-out ::idle} r) (realized? body-read))
                      (deref writing)
                      r))
                  (catch InterruptedException e
@@ -647,8 +754,9 @@
                      (close-quietly in)
                      (deref finished cleanup-grace-ms nil))
                    (close-quietly in)))]
-    (if (= ::timed-out result)
-      (timed-out! uri timeout-ms)
+    (case result
+      ::timed-out (timed-out! uri timeout-ms)
+      ::idle (idle-timed-out! uri idle-timeout-ms)
       (let [{:keys [path error]} result
             data (ex-data error)]
         (cond
@@ -657,6 +765,162 @@
           (::read-error data) (send-failure! (::read-error data) uri {:timeout-ms timeout-ms})
           (bfs/refusal? error) (file-failed! uri file error)
           :else (throw error))))))
+
+;; Reading lines
+
+(defn- utf8-cut
+  "The largest index at most limit at which b can be cut without
+   splitting a UTF-8 sequence: a continuation byte never starts a cut."
+  ^long [^bytes b ^long limit]
+  (loop [i limit]
+    (if (and (pos? i) (= 0x80 (bit-and 0xC0 (long (aget b i)))))
+      (recur (dec i))
+      i)))
+
+(defn- line-failure
+  [k]
+  (ex-info "line reading stopped" {k true}))
+
+(defn- read-lines!
+  "Reads in to its end and hands every line to emit!, which answers false
+   once the request has stopped listening. The line being assembled holds
+   at most one byte over max-line-bytes, room for the \r of a line end,
+   so a line without end never grows past the bound. Returns {:end :eof},
+   {:end :max-lines}, {:stopped true}, {:too-large true}, {:line-too-long
+   true}, {:handler-error true} or {:error e}."
+  [^InputStream in {:keys [max-bytes max-line-bytes max-lines on-long-line]}
+   {:keys [^AtomicLong progress ^AtomicLong lines ^AtomicLong shortened emit!]}]
+  (let [truncate? (= :truncate on-long-line)
+        max-line (long max-line-bytes)
+        cap (inc max-line)
+        line (ByteArrayOutputStream.)
+        over (volatile! false)
+        chunk (byte-array 65536)
+        finish! (fn [terminated?]
+                  (let [b (.toByteArray line)
+                        n (alength b)
+                        n (if (and terminated? (not @over) (pos? n) (= 13 (aget b (dec n)))) (dec n) n)]
+                    (.reset line)
+                    (vreset! over false)
+                    (if (<= n max-line)
+                      (emit! (String. b 0 (int n) StandardCharsets/UTF_8))
+                      (if truncate?
+                        (do (.incrementAndGet shortened)
+                            (emit! (String. b 0 (int (utf8-cut b max-line)) StandardCharsets/UTF_8)))
+                        (throw (line-failure ::line-too-long))))))
+        append! (fn [^long start ^long end]
+                  (let [amount (- end start)
+                        room (- cap (.size line))]
+                    (cond
+                      (<= amount room) (.write line chunk (int start) (int amount))
+                      truncate? (do (when (pos? room) (.write line chunk (int start) (int room)))
+                                    (vreset! over true))
+                      :else (throw (line-failure ::line-too-long)))))
+        full? (fn [] (and max-lines (<= (long max-lines) (.get lines))))]
+    (try
+      (loop [total 0]
+        (let [n (.read in chunk)]
+          (if (neg? n)
+            (if (or (pos? (.size line)) @over)
+              (if (finish! false) {:end :eof} {:stopped true})
+              {:end :eof})
+            (let [total (+ total n)]
+              (touch! progress)
+              (if (< (long max-bytes) total)
+                {:too-large true}
+                ;; ISO-8859-1 maps each byte to one char, so the native
+                ;; indexOf finds the line ends at their byte offsets
+                (let [s (String. chunk 0 n StandardCharsets/ISO_8859_1)
+                      r (loop [start 0]
+                          (let [i (.indexOf s (int 10) (int start))]
+                            (if (neg? i)
+                              (do (append! start n) ::more)
+                              (do (append! start i)
+                                  (cond
+                                    (not (finish! true)) ::stopped
+                                    (full?) ::max-lines
+                                    :else (recur (inc i)))))))]
+                  (case r
+                    ::more (recur total)
+                    ::stopped {:stopped true}
+                    ::max-lines {:end :max-lines})))))))
+      (catch clojure.lang.ExceptionInfo e
+        (let [d (ex-data e)]
+          (cond
+            (::handler-error d) {:handler-error true}
+            (::line-too-long d) {:line-too-long true}
+            :else {:error e})))
+      (catch Exception e {:error e}))))
+
+(defn- read-lines-body
+  "Reads the 2xx body of resp as lines within the bounds of opts and
+   returns the keys `request` adds to the answer. The read runs on a
+   thread of its own. When it has to stop early, the request first stops
+   listening and waits up to `cleanup-grace-ms` for a running :on-line
+   call, so that no call starts after this function returns."
+  [^HttpResponse resp ^URI uri method deadline
+   {:keys [max-bytes max-line-bytes on-line on-long-line timeout-ms idle-timeout-ms] :as opts}]
+  (let [^InputStream in (.body resp)
+        _ (check-declared! resp uri method max-bytes)
+        progress (AtomicLong. (System/nanoTime))
+        lines (AtomicLong. 0)
+        shortened (AtomicLong. 0)
+        collected (atom [])
+        handler (or on-line #(swap! collected conj %))
+        stopped (volatile! false)
+        gate (Semaphore. 1)
+        emit! (fn [line]
+                (.acquire gate)
+                (try
+                  (if @stopped
+                    false
+                    (do (try (handler line)
+                             (catch Exception _
+                               ;; the exception may quote the line, so only
+                               ;; the fact that it was thrown travels on
+                               (throw (line-failure ::handler-error))))
+                        (.incrementAndGet lines)
+                        true))
+                  (finally (.release gate))))
+        reading (future (read-lines! in opts {:progress progress :lines lines :shortened shortened :emit! emit!}))
+        stop! (fn []
+                (vreset! stopped true)
+                (let [held (try (.tryAcquire gate cleanup-grace-ms TimeUnit/MILLISECONDS)
+                                (catch InterruptedException _
+                                  (.interrupt (Thread/currentThread))
+                                  false))]
+                  (future-cancel reading)
+                  (close-quietly in)
+                  (when held (.release gate))))
+        result (try
+                 (let [r (await-reader reading progress deadline idle-timeout-ms)]
+                   (if (and (keyword? r) (realized? reading)) @reading r))
+                 (catch InterruptedException e
+                   (.interrupt (Thread/currentThread))
+                   (refuse! ::interrupted "interrupted while reading the response" {:url (redacted uri)} e))
+                 (finally
+                   (when-not (realized? reading) (stop!))
+                   (close-quietly in)))
+        answer (fn [truncated]
+                 (cond-> {:lines-read (.get lines)
+                          :body (when-not on-line @collected)}
+                   truncated (assoc :truncated truncated)
+                   (= :truncate on-long-line) (assoc :lines-truncated (.get shortened))))]
+    (cond
+      (= ::timed-out result) (answer :deadline)
+      (= ::idle result) (idle-timed-out! uri idle-timeout-ms)
+      (= :eof (:end result)) (answer nil)
+      (= :max-lines (:end result)) (answer :max-lines)
+      (:too-large result) (too-large! uri max-bytes)
+      (:line-too-long result)
+      (refuse! ::line-too-long (format "line %d is longer than %d bytes" (inc (.get lines)) max-line-bytes)
+               {:url (redacted uri) :limit max-line-bytes :line (inc (.get lines))})
+      (:handler-error result)
+      (refuse! ::on-line-failed (format "the :on-line function threw at line %d; the request was stopped"
+                                        (inc (.get lines)))
+               {:url (redacted uri) :line (inc (.get lines))})
+      (:error result) (send-failure! (:error result) uri {:timeout-ms timeout-ms})
+      :else (refuse! ::failed "the line reader stopped unexpectedly" {:url (redacted uri)}))))
 
 ;; Tunnel
 
@@ -854,6 +1118,12 @@
                            :headers (response-headers resp)
                            :url (str uri)}]
                (cond
+                 (and (= :lines as) (<= 200 status 299))
+                 (merge answer (read-lines-body resp uri (:method hop) deadline opts))
+
+                 (= :lines as)
+                 (assoc answer :body (String. (read-body resp uri (:method hop) deadline opts) StandardCharsets/UTF_8))
+
                  (not (map? as))
                  (let [bs (read-body resp uri (:method hop) deadline opts)]
                    (assoc answer :body (if (= :text as) (String. bs StandardCharsets/UTF_8) bs)))
