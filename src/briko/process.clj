@@ -40,6 +40,16 @@
    program and every holder of its output are done, or until the waiting
    thread is interrupted, which kills the tree as a timeout would.
 
+   An :on-start function is called once the program has started, on the
+   thread that called `run`, with a handle {:pid :stop}: the program's
+   pid and a function that kills the program, its tree and every holder
+   of its output exactly as a timeout does, from any thread, such as a
+   JVM shutdown hook. A stopped run returns with the program's exit
+   (137 after SIGKILL) and :stopped? true. :stop is idempotent and does
+   nothing once the run has timed out, been interrupted or returned. A
+   callback that throws has the program stopped the same way, and `run`
+   refuses with ::on-start-failed, the callback's exception as cause.
+
    On a timeout the program is killed with SIGKILL, then every descendant
    seen while it ran, then, where /proc exists, every process still
    holding one of its output pipes, also one started and detached between
@@ -98,7 +108,10 @@
    - :out-keep and :err-keep, which part of a stream past its limit is
      kept: :head, its first bytes, or :tail, its last ones: :head.
    - :inherit-err?, whether stderr goes to this process's stderr instead
-     of being captured: false."
+     of being captured: false.
+   - :on-start, a function called with the handle {:pid :stop} once the
+     program has started, or nil: nil. With one, the result also carries
+     :stopped?, whether :stop took effect before the run finished."
   {:timeout-ms 60000
    :extra-env {}
    :unset-env []
@@ -109,11 +122,12 @@
    :max-err-bytes 65536
    :out-keep :head
    :err-keep :head
-   :inherit-err? false})
+   :inherit-err? false
+   :on-start nil})
 
 (def refusal-types
   "Every :type a refusal carries."
-  #{::invalid-argv ::invalid-options})
+  #{::invalid-argv ::invalid-options ::on-start-failed})
 
 (defn- refuse!
   [type message data]
@@ -164,7 +178,8 @@
    :max-err-bytes [(partial int-at-most? (dec Integer/MAX_VALUE)) "an int from 0 below Integer/MAX_VALUE"]
    :out-keep [#{:head :tail} ":head or :tail"]
    :err-keep [#{:head :tail} ":head or :tail"]
-   :inherit-err? [boolean? "a boolean"]})
+   :inherit-err? [boolean? "a boolean"]
+   :on-start [(fn [f] (or (nil? f) (fn? f))) "nil or a function of one argument"]})
 
 (def ^:private contradictions
   "[option given, options it rules out, why], each refused when given
@@ -511,29 +526,63 @@
   (.destroyForcibly proc)
   (run! (fn [^java.lang.ProcessHandle h] (.destroyForcibly h)) @seen))
 
+(defn- kill-all!
+  "Kills the program's tree and every process holding one of its output
+   pipes below pipe-dir: what a timeout, an interruption and a stop do."
+  [proc seen pipe-dir]
+  (kill-tree! proc seen)
+  (kill-holders! pipe-dir))
+
+(defn- controller
+  "The state of one launched run and the only way to end it early. Every
+   transition runs under one lock: :running becomes :done when the run
+   finished, or :stopped, :timed-out, :interrupted or :on-start-failed,
+   each of which kills the tree and the holders while the lock is held, so
+   the run cannot return and remove its pipes in the middle of a kill.
+   `halt!` answers whether this call ended the run."
+  [proc seen pipe-dir]
+  (let [lock (Object.)
+        state (volatile! :running)]
+    {:state (fn [] @state)
+     :halt! (fn [to]
+              (locking lock
+                (when (= :running @state)
+                  (vreset! state to)
+                  (kill-all! proc seen pipe-dir)
+                  true)))
+     :done! (fn []
+              (locking lock
+                (when (= :running @state)
+                  (vreset! state :done))
+                @state))}))
+
 (def ^:private grace-ms
   "How long a timed-out run waits for the output its killed tree wrote."
   200)
 
 (defn- await!
   "Waits until the program has exited and both output threads finished, or
-   the deadline passed, sampling descendants with a growing interval while
-   the program runs. Returns true when the run finished in time.
+   the deadline passed, or stopped? answers true, sampling descendants with
+   a growing interval while the program runs. Returns :finished,
+   :deadline or :stopped.
 
    The first sample is taken only after the program ran for one interval:
    walking the process table costs about 15 ms with 600 processes, more
    than a short program takes, and the samples serve only to kill a tree
    that outlives its deadline, which a program that has exited cannot."
-  [^Process proc ^Thread out-thread ^Thread err-thread deadline seen]
+  [^Process proc ^Thread out-thread ^Thread err-thread deadline seen stopped?]
   (loop [interval 10]
     (let [left (remaining-ms deadline)
           step (min left (long interval))]
       (cond
+        (stopped?)
+        :stopped
+
         (and (not (.isAlive proc)) (not (.isAlive out-thread)) (not (.isAlive err-thread)))
-        true
+        :finished
 
         (zero? left)
-        false
+        :deadline
 
         :else
         (do (if (.isAlive proc)
@@ -611,7 +660,7 @@
            {:out (text (:bytes out)) :out-truncated? (:dropped? out)})))
 
 (defn- run-with-pipes
-  [argv {:keys [in max-err-bytes err-keep inherit-err?] :as opts} deadline ^String pipe-dir]
+  [argv {:keys [in max-err-bytes err-keep inherit-err? on-start] :as opts} deadline ^String pipe-dir]
   (let [paths (cond-> [(str pipe-dir File/separator "out")]
                 (not inherit-err?) (conj (str pipe-dir File/separator "err")))
         failure (make-fifos! paths (or deadline (deadline-of setup-ms)))
@@ -627,31 +676,60 @@
                        (locked-sink (fn [_ _] true) (fn [] {:bytes (byte-array 0) :dropped? false}))
                        (capture-sink err-keep max-err-bytes))
             seen (atom #{})
+            {:keys [state halt! done!]} (controller proc seen pipe-dir)
             _ (feed! (.getOutputStream proc) in)
             out-thread (drain! (first readers) out-sink)
             err-thread (if inherit-err?
                          (daemon! (fn []))
                          (drain! (second readers) err-sink))
-            finished? (try
-                        (await! proc out-thread err-thread deadline seen)
-                        (catch InterruptedException e
-                          (kill-tree! proc seen)
-                          (kill-holders! pipe-dir)
-                          ((:finish out-sink))
-                          (.interrupt (Thread/currentThread))
-                          (throw e)))]
-        (when-not finished?
-          (kill-tree! proc seen)
-          (kill-holders! pipe-dir)
-          ;; The pipes close once the killed processes are gone; a short
-          ;; grace collects what they wrote before the deadline. A pipe a
-          ;; process out of reach still holds is abandoned to its daemon
-          ;; thread, whose sink no longer accepts bytes once finished.
-          (let [grace (deadline-of grace-ms)]
-            (.join out-thread (max 1 (remaining-ms grace)))
-            (.join err-thread (max 1 (remaining-ms grace)))))
-        (result (if finished? (.exitValue proc) 124) (not finished?) opts
-                ((:finish out-sink)) ((:finish err-sink)))))))
+            collect! (fn []
+                       ;; The pipes close once the killed processes are
+                       ;; gone; a short grace collects what they wrote
+                       ;; before. A pipe a process out of reach still holds
+                       ;; is abandoned to its daemon thread, whose sink no
+                       ;; longer accepts bytes once finished.
+                       (let [grace (deadline-of grace-ms)]
+                         (.waitFor proc (max 1 (remaining-ms grace)) TimeUnit/MILLISECONDS)
+                         (.join out-thread (max 1 (remaining-ms grace)))
+                         (.join err-thread (max 1 (remaining-ms grace)))))
+            interrupted! (fn [^InterruptedException e]
+                           (halt! :interrupted)
+                           ((:finish out-sink))
+                           (.interrupt (Thread/currentThread))
+                           (throw e))]
+        (try
+          (when on-start
+            (try
+              (on-start {:pid (.pid proc) :stop (fn [] (boolean (halt! :stopped)))})
+              (catch InterruptedException e
+                (interrupted! e))
+              ;; Whatever the callback threw, the program must not outlive it.
+              #_{:splint/disable [lint/catch-throwable]}
+              (catch Throwable e
+                (halt! :on-start-failed)
+                (collect!)
+                ((:finish out-sink))
+                ((:finish err-sink))
+                (throw (ex-info "the :on-start callback threw; the program was stopped"
+                                {:type ::on-start-failed}
+                                e)))))
+          (let [outcome (try
+                          (await! proc out-thread err-thread deadline seen #(= :stopped (state)))
+                          (catch InterruptedException e
+                            (interrupted! e)))
+                timed-out? (and (= :deadline outcome) (halt! :timed-out))]
+            (when-not (= :finished outcome)
+              (collect!))
+            (let [final (done!)
+                  exit (cond
+                         timed-out? 124
+                         ;; A killed program not reaped within the grace.
+                         (.isAlive proc) 137
+                         :else (.exitValue proc))]
+              (cond-> (result exit (boolean timed-out?) opts ((:finish out-sink)) ((:finish err-sink)))
+                on-start (assoc :stopped? (= :stopped final)))))
+          (finally
+            (done!)))))))
 
 (defn run
   "Runs argv, a non-empty sequence of strings whose first element is the
@@ -661,7 +739,9 @@
    file. A program that cannot be launched answers exit 127, one that
    overruns :timeout-ms answers exit 124 after its process tree was killed.
    A run whose :out-error is set left an incomplete file, whatever its
-   exit."
+   exit. With :on-start the result also carries :stopped?, and a callback
+   that throws makes `run` refuse with ::on-start-failed after the
+   program was stopped."
   ([argv] (run argv nil))
   ([argv opts]
    (check-argv! argv)

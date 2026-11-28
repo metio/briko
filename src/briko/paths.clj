@@ -3,8 +3,8 @@
 
 (ns briko.paths
   "Where a program keeps its files: the XDG base directories, the home
-   directory, `~` in configured paths, and an EDN configuration file read
-   over defaults.
+   directory, `~` in configured paths and in paths shown to a person, and
+   an EDN configuration file read over defaults.
 
    The base directories follow the XDG Base Directory Specification 0.8.
    A variable that is unset, empty, blank or relative counts as unset,
@@ -172,6 +172,33 @@
    password database knows. nil passes through."
   ([s] (expand-home s nil))
   ([s opts] (expand-home* s (env-options opts env-keys))))
+
+(defn- abbreviate-home*
+  [s opts]
+  (cond
+    (nil? s) nil
+    (not (string? s)) (refuse! ::invalid-input (str "the path must be a string, not a " (.getName (class s))) {})
+    :else (let [home (try (home* opts)
+                          (catch clojure.lang.ExceptionInfo e
+                            (when-not (= ::no-home (:type (ex-data e))) (throw e))))]
+            (cond
+              (nil? home) s
+              (= home s) "~"
+              (str/starts-with? s (str home "/")) (str "~" (subs s (count home)))
+              :else s))))
+
+(defn abbreviate-home
+  "s with the home directory it starts with replaced by `~`: the home
+   directory itself becomes `~`, a path below it `~/…`, and the rest of s
+   is kept as it is. The home directory is resolved as `home` does and
+   matched on a path boundary only, so /home/sebastian stays as it is
+   when the home directory is /home/seb. Any other string, a relative
+   path included, is returned as it is, and so is every string when
+   there is no home directory, since a display needs no refusal. The
+   result of an absolute s reads back through `expand-home` to s. nil
+   passes through."
+  ([s] (abbreviate-home s nil))
+  ([s opts] (abbreviate-home* s (env-options opts env-keys))))
 
 ;; Configuration files
 

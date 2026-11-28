@@ -59,6 +59,14 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (process/run ["stty" "size"] {:in :tty})
 ```
 
+  `:on-start` receives `{:pid … :stop (fn [])}` once the program has started. `:stop` kills the program, its tree and every holder of its output as a timeout does, from any thread, so a JVM shutdown hook can end a run in flight; the run then returns the program's exit (137 after SIGKILL) with `:stopped? true`, a key every result of a run with `:on-start` carries. `:stop` is idempotent and does nothing once the run has returned. A callback that throws has the program stopped and `run` refuses with `:briko.process/on-start-failed`.
+
+```clojure
+(def running (atom nil))
+(.addShutdownHook (Runtime/getRuntime) (Thread. (fn [] (when-let [h @running] ((:stop h))))))
+(process/run ["make" "release"] {:timeout-ms :none :on-start (fn [handle] (reset! running handle))})
+```
+
 - `briko.secret` resolves secrets named in configuration at the moment of use: `{:env "NAME"}`, `{:file "/path"}`, `{:credential "NAME"}` (systemd credentials) and `{:command ["pass" "show" "x"]}`. An unset variable, a missing file, an empty or blank value and a command that fails or overruns its deadline are refused; no refusal carries the secret or the command's output.
 
 ```clojure
@@ -119,7 +127,7 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 ;; => {:verdict :malformed :code :unknown-format :reason "unknown manifest format \"v2\""}
 ```
 
-- `briko.paths` names where a program keeps its files: the XDG base directories, ignoring a variable that is empty, blank or relative as the specification asks; the home directory (`$HOME` when absolute, else the `user.home` property, else a refusal); `expand-home` for `~` and `~/…`; and `load-edn-config`, which reads one map through `briko.edn` and merges it over defaults. An empty or comment-only file and a dangling symbolic link are refused unless the caller opts in with `:empty :defaults` or `:dangling :missing`.
+- `briko.paths` names where a program keeps its files: the XDG base directories, ignoring a variable that is empty, blank or relative as the specification asks; the home directory (`$HOME` when absolute, else the `user.home` property, else a refusal); `expand-home` for `~` and `~/…`; `abbreviate-home`, its inverse for display, which writes the home directory as `~` on a path boundary only; and `load-edn-config`, which reads one map through `briko.edn` and merges it over defaults. An empty or comment-only file and a dangling symbolic link are refused unless the caller opts in with `:empty :defaults` or `:dangling :missing`.
 
 ```clojure
 (require '[briko.paths :as paths])
