@@ -171,6 +171,12 @@
 
 ;; Bytes and characters
 
+(def ^:private babashka?
+  "Whether this runs under babashka, which interprets a loop written here
+   while a regex or a JDK method runs natively; on the JVM a compiled loop
+   over the characters is the faster of the two."
+  (some? (System/getProperty "babashka.version")))
+
 (defn- too-large!
   [max-bytes]
   (refuse! ::too-large (format "the input is larger than %d bytes" max-bytes) {:limit max-bytes}))
@@ -186,26 +192,78 @@
       (catch CharacterCodingException e
         (refuse! ::invalid-utf8 "the input is not valid UTF-8" {} e)))))
 
+(defn- utf-8-count
+  "The length of s in UTF-8 counted in a loop over its characters, or -1
+   when s holds a surrogate standing alone."
+  [^String s]
+  (let [n (.length s)]
+    (loop [i 0
+           total 0]
+      (if (< i n)
+        (let [c (int (.charAt s i))]
+          (cond
+            (< c 0x80) (recur (inc i) (inc total))
+            (< c 0x800) (recur (inc i) (+ total 2))
+            (or (< c 0xD800) (> c 0xDFFF)) (recur (inc i) (+ total 3))
+            (and (< c 0xDC00) (< (inc i) n) (<= 0xDC00 (int (.charAt s (inc i))) 0xDFFF))
+            (recur (+ i 2) (+ total 4))
+            :else -1))
+        total))))
+
 (defn- utf-8-length
   "The length of s in UTF-8, refusing a string holding an unpaired
-   surrogate, which has no UTF-8 encoding."
+   surrogate, which has no UTF-8 encoding. babashka encodes natively;
+   the JVM counts in a compiled loop without encoding."
   ^long [^String s]
-  (let [encoder (doto (.newEncoder StandardCharsets/UTF_8)
-                  (.onMalformedInput CodingErrorAction/REPORT)
-                  (.onUnmappableCharacter CodingErrorAction/REPORT))]
-    (try
-      (.remaining ^ByteBuffer (.encode encoder (CharBuffer/wrap s)))
-      (catch CharacterCodingException e
-        (refuse! ::invalid-utf8 "the input holds an unpaired surrogate and is not valid UTF-8" {} e)))))
+  (if babashka?
+    (let [encoder (doto (.newEncoder StandardCharsets/UTF_8)
+                    (.onMalformedInput CodingErrorAction/REPORT)
+                    (.onUnmappableCharacter CodingErrorAction/REPORT))]
+      (try
+        (.remaining ^ByteBuffer (.encode encoder (CharBuffer/wrap s)))
+        (catch CharacterCodingException e
+          (refuse! ::invalid-utf8 "the input holds an unpaired surrogate and is not valid UTF-8" {} e))))
+    (let [n (long (utf-8-count s))]
+      (when (neg? n)
+        (refuse! ::invalid-utf8 "the input holds an unpaired surrogate and is not valid UTF-8"))
+      n)))
 
 ;; Numbers
 ;;
 ;; Jackson bounds the parts of a number separately, so its limit alone
-;; would let a literal of several times :max-number-chars through. A
-;; native pre-check finds whether the text holds a run of number
-;; characters as long as the limit, or an exponent of three digits, the
-;; only ways a literal within 300 characters can overflow a double; only
-;; then does a token scan skip the strings and judge each number literal.
+;; would let a literal of several times :max-number-chars through, and
+;; cheshire reads a decimal that overflows a double as Infinity. So every
+;; number literal outside the strings is judged here before Jackson
+;; reads the text: one longer than the limit, sign, point and exponent
+;; included, and a decimal whose value is infinite as a double are
+;; refused.
+;;
+;; On the JVM a compiled loop over the characters finds the literals.
+;; babashka interprets such a loop, so there a screen runs first: one
+;; native match of a regex that walks the whole text through strings,
+;; other characters and number literals that cannot be refused, and stops
+;; at anything else. Only a text the screen does not walk to its end goes
+;; through `check-numbers!`, a regex token scan that loops once per
+;; string and number. A literal cannot be refused when it is at most
+;; min(limit, 200) characters long and holds no exponent of three
+;; digits: a literal that overflows a double needs such an exponent or at
+;; least 210 digits before the point. The screen also stops at a
+;; surrogate standing alone, so a text it walks is valid UTF-8.
+
+(defn- judge-number!
+  "Refuses the number literal n when it is longer than max-number-chars
+   or, being a decimal, overflows a double. A literal of fewer than five
+   characters cannot overflow: the shortest that does is 2e308."
+  [^String n ^long max-number-chars]
+  (when (> (.length n) max-number-chars)
+    (refuse! ::number-too-long
+             (format "a number literal is longer than %d characters" max-number-chars)
+             {:limit max-number-chars}))
+  (when (and (> (.length n) 4)
+             (re-find #"[.eE]" n)
+             (try (Double/isInfinite (Double/parseDouble n))
+                  (catch NumberFormatException _ false)))
+    (refuse! ::number-out-of-range "a number literal is too large for a double")))
 
 (def ^:private number-token
   ;; A string literal (the loop unrolled with possessive quantifiers, so a
@@ -213,25 +271,89 @@
   ;; that opens a string never closed, or a number literal.
   #"(\"[^\"\\]*+(?:\\[\s\S][^\"\\]*+)*+\")|(\")|(-?[0-9][-+.eE0-9]*)")
 
-(defn- number-suspect
-  [^long max-number-chars]
-  (re-pattern (str "[eE][-+]?[0-9]{3}|[-+.eE0-9]{" (min (inc max-number-chars) 300) ",}")))
-
 (defn- check-numbers!
+  "Judges every number literal outside the strings of s, found by
+   `number-token`. Stops at a string that is never closed."
   [^String s {:keys [max-number-chars]}]
-  (let [max-number-chars (long max-number-chars)]
-    (when (re-find (number-suspect max-number-chars) s)
-      (let [^Matcher m (re-matcher number-token s)]
-        (while (and (.find m) (nil? (.group m 2)))
-          (when-let [^String n (.group m 3)]
-            (when (> (.length n) max-number-chars)
-              (refuse! ::number-too-long
-                       (format "a number literal is longer than %d characters" max-number-chars)
-                       {:limit max-number-chars}))
-            (when (and (re-find #"[.eE]" n)
-                       (try (Double/isInfinite (Double/parseDouble n))
-                            (catch NumberFormatException _ false)))
-              (refuse! ::number-out-of-range "a number literal is too large for a double"))))))))
+  (let [max-number-chars (long max-number-chars)
+        ^Matcher m (re-matcher number-token s)]
+    (while (and (.find m) (nil? (.group m 2)))
+      (when-let [^String n (.group m 3)]
+        (judge-number! n max-number-chars)))))
+
+(defn- digit?
+  [^long c]
+  (<= 48 c 57))
+
+(defn- number-char?
+  "Whether c is one of -+.eE0-9."
+  [^long c]
+  (or (digit? c) (== c 45) (== c 43) (== c 46) (== c 101) (== c 69)))
+
+(defn- scan-numbers!
+  "Judges the same literals as `check-numbers!` in one compiled loop over
+   the characters of s: a quote opens a string that a backslash escapes
+   the next character of, and a digit, or a minus before one, starts a
+   literal that runs over every following character of -+.eE0-9."
+  [^String s {:keys [max-number-chars]}]
+  (let [max-number-chars (long max-number-chars)
+        n (.length s)]
+    (loop [i 0]
+      (when (< i n)
+        (let [c (int (.charAt s i))]
+          (cond
+            (== c 34)
+            (let [close (long (loop [j (inc i)]
+                                (if (< j n)
+                                  (let [d (int (.charAt s j))]
+                                    (cond
+                                      (== d 92) (recur (+ j 2))
+                                      (== d 34) j
+                                      :else (recur (inc j))))
+                                  -1)))]
+              (when (>= close 0)
+                (recur (inc close))))
+
+            (or (digit? c)
+                (and (== c 45) (< (inc i) n) (digit? (int (.charAt s (inc i))))))
+            (let [end (long (loop [j (inc i)]
+                              (if (and (< j n) (number-char? (int (.charAt s j))))
+                                (recur (inc j))
+                                j)))]
+              (judge-number! (.substring s i end) max-number-chars)
+              (recur end))
+
+            :else
+            (recur (inc i))))))))
+
+(defn- screen-pattern
+  [^long max-number-chars]
+  (re-pattern
+   (str "(?:"
+        ;; Anything but a quote, a digit, a minus or a surrogate. Greedy
+        ;; classes are matched in a tight loop; nothing after them in an
+        ;; alternative can make them give characters back.
+        "[^\"0-9\\-\\x{D800}-\\x{DFFF}]+"
+        ;; A string literal, its escapes in a possessive loop.
+        "|\"[^\"\\\\\\x{D800}-\\x{DFFF}]*(?:\\\\[^\\x{D800}-\\x{DFFF}][^\"\\\\\\x{D800}-\\x{DFFF}]*)*+\""
+        ;; A number literal of at most the safe length, ending where the
+        ;; run of number characters ends, with no exponent of three digits.
+        "|(?=[-+.eE0-9]{1," (min max-number-chars 200) "}+(?![-+.eE0-9]))"
+        "-?[0-9](?:[-+.0-9]+|[eE](?![-+]?[0-9]{3}))*+(?![-+.eE0-9])"
+        ")*+")))
+
+(def ^:private default-screen (screen-pattern (:max-number-chars defaults)))
+
+(defn- screened?
+  "Whether the screen walks s to its end, so s holds no surrogate standing
+   alone and no number literal the scan could refuse."
+  [^String s max-number-chars]
+  (let [max-number-chars (long max-number-chars)
+        ^Matcher m (re-matcher (if (= max-number-chars (long (:max-number-chars defaults)))
+                                 default-screen
+                                 (screen-pattern max-number-chars))
+                               s)]
+    (and (.lookingAt m) (= (.end m) (.length s)))))
 
 ;; The read
 
@@ -350,8 +472,11 @@
   value)
 
 (defn- read-text
-  [^String text {:keys [one-value? expect] :as opts}]
-  (check-numbers! text opts)
+  [^String text screened? {:keys [one-value? expect] :as opts}]
+  (cond
+    screened? nil
+    babashka? (check-numbers! text opts)
+    :else (scan-numbers! text opts))
   (let [values (read-values text opts)]
     (if one-value?
       (if (seq values)
@@ -372,11 +497,21 @@
          max-bytes (long (:max-bytes opts))]
      (when-not (string? s)
        (refuse! ::invalid-input (str "the input must be a string, not " (describe s))))
-     ;; Every character takes at least one byte, so a string with more
-     ;; characters than the limit is too large without encoding it.
-     (when (or (> (.length ^String s) max-bytes) (> (utf-8-length s) max-bytes))
+     ;; Every character takes at least one byte and at most three, so a
+     ;; string with more characters than the limit is too large, and one
+     ;; with at most a third as many is not, without encoding it.
+     (when (> (.length ^String s) max-bytes)
        (too-large! max-bytes))
-     (read-text s opts))))
+     (let [screened? (and babashka? (screened? s (:max-number-chars opts)))]
+       ;; A screened text holds no surrogate standing alone, so
+       ;; String.getBytes, which runs natively also under babashka, counts
+       ;; its UTF-8 bytes exactly.
+       (when (cond
+               (not screened?) (> (utf-8-length s) max-bytes)
+               (> (* 3 (.length ^String s)) max-bytes) (> (alength (.getBytes ^String s StandardCharsets/UTF_8)) max-bytes)
+               :else false)
+         (too-large! max-bytes))
+       (read-text s screened? opts)))))
 
 (defn parse-bytes
   "The JSON value the UTF-8 bytes bs hold, read like `parse-string`."
@@ -387,7 +522,8 @@
        (refuse! ::invalid-input (str "the input must be a byte array, not " (describe bs))))
      (when (> (count bs) (long (:max-bytes opts)))
        (too-large! (:max-bytes opts)))
-     (read-text (decode-utf-8 bs) opts))))
+     (let [text (decode-utf-8 bs)]
+       (read-text text (and babashka? (screened? text (:max-number-chars opts))) opts)))))
 
 (defn parse-stream
   "The JSON value the UTF-8 stream in holds, read like `parse-string`.
@@ -449,8 +585,10 @@
 (def ^:private hidden-in-text
   "A hidden code point other than tab, newline and carriage return: the
    whitespace JSON reads between values, and which a JSON printer already
-   escapes inside a string."
-  (re-pattern (str "[" hidden-class "&&[^\\t\\n\\r]]")))
+   escapes inside a string. Java tests an intersection from the left and
+   stops at the first class that fails, so printable ASCII costs one
+   range check instead of the Unicode categories."
+  (re-pattern (str "[[^\\x20-\\x7E\\t\\n\\r]&&[" hidden-class "]]")))
 
 (defn hidden?
   "Whether the code point cp must not reach a reader raw: a control,
@@ -475,9 +613,11 @@
   [printed]
   (let [printed (str printed)]
     ;; Printable ASCII, tab, newline and return hold no hidden code point,
-    ;; and this class is matched far faster than the Unicode one.
+    ;; and this class is matched far faster than the Unicode one. Runs of
+    ;; them are cut to one space before the search, which keeps a
+    ;; surrogate standing alone from meeting another across the cut.
     (if (and (re-find #"[^\x20-\x7E\t\n\r]" printed)
-             (re-find hidden-in-text printed))
+             (re-find hidden-in-text (str/replace printed #"[\x20-\x7E\t\n\r]+" " ")))
       (str/replace printed hidden-in-text unicode-escape)
       printed)))
 
@@ -488,31 +628,43 @@
   [k]
   (if (keyword? k) (subs (str k) 1) (str k)))
 
+(defn- distinct-names?
+  "Whether the keys of m print to distinct names. Distinct strings, and
+   distinct keywords without a namespace, always do; the predicates over
+   them run natively, so only a map with other keys pays for printing
+   every name."
+  [^java.util.Map m]
+  (let [ks (.keySet m)]
+    (or (every? string? ks)
+        (every? simple-keyword? ks)
+        (= (.size m) (count (into #{} (map printed-name) ks))))))
+
+(def ^:private nested?
+  (some-fn (partial instance? java.util.Map) (partial instance? java.util.Collection) seq?))
+
+(defn- children
+  [v]
+  (if (instance? java.util.Map v) (.values ^java.util.Map v) v))
+
 (defn- check-value!
   "Refuses x when it nests deeper than max-depth maps and collections or,
    unless duplicates are allowed, holds a map with two keys that print to
-   the same name. Iterative, so a value too deep for cheshire's recursive
-   printer is refused before the printer sees it."
+   the same name. It walks one level at a time and keeps only the nested
+   values of the next, so a scalar costs no step of the interpreted loop,
+   and a value too deep for cheshire's recursive printer is refused
+   before the printer sees it. A value with both faults is refused for
+   the one on the shallower level, a duplicate first on the same level."
   [x max-depth allow-duplicate-keys?]
   (let [max-depth (long max-depth)]
-    (loop [todo (list [x 0])]
-      (when-let [[[v depth] & more] (seq todo)]
-        (let [depth (long depth)
-              nested? (or (instance? java.util.Map v) (instance? java.util.Collection v) (seq? v))]
-          (when (and nested? (>= depth max-depth))
-            (refuse! ::too-deep (format "the value nests deeper than %d levels" max-depth) {:limit max-depth}))
-          (cond
-            (instance? java.util.Map v)
-            (let [m ^java.util.Map v]
-              (when-not (or allow-duplicate-keys?
-                            (= (.size m) (count (into #{} (map printed-name) (.keySet m)))))
-                (refuse! ::duplicate-key "a map holds two keys that print to the same JSON name"))
-              (recur (into more (map #(vector % (inc depth))) (.values m))))
-
-            nested?
-            (recur (into more (map #(vector % (inc depth))) v))
-
-            :else (recur more)))))))
+    (loop [level (if (nested? x) [x] [])
+           depth 0]
+      (when (seq level)
+        (when (>= depth max-depth)
+          (refuse! ::too-deep (format "the value nests deeper than %d levels" max-depth) {:limit max-depth}))
+        (when-not (or allow-duplicate-keys?
+                      (every? distinct-names? (filter (partial instance? java.util.Map) level)))
+          (refuse! ::duplicate-key "a map holds two keys that print to the same JSON name"))
+        (recur (into [] (comp (mapcat children) (filter nested?)) level) (inc depth))))))
 
 (defn write-string
   "x as JSON text, printed by cheshire with every hidden code point
