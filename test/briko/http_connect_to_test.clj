@@ -201,6 +201,24 @@
         ((:close tunnel))
         (.close upstream)))))
 
+(defn- listening?
+  "Whether something accepts connections on the loopback port. A probe whose
+  ephemeral source port equals the port it dials joins itself (a TCP
+  self-connect) and succeeds although nothing listens, so that counts as not
+  listening."
+  [port]
+  (try
+    (with-open [s (Socket. "127.0.0.1" (int port))]
+      (not= (.getLocalPort s) (int port)))
+    (catch java.io.IOException _ false)))
+
+(deftest listening-tells-a-live-listener-from-a-closed-port
+  (let [server (ServerSocket. 0 8 (InetAddress/getByName "127.0.0.1"))
+        port (.getLocalPort server)]
+    (is (listening? port) "control: a live listener is open")
+    (.close server)
+    (is (not (listening? port)))))
+
 (deftest the-tunnel-is-closed-when-the-request-returns
   (with-server [s (f/start! (ok-handler "x") {:tls? true :cert :forge})]
     (let [start @#'briko.http/start-tunnel!
@@ -212,7 +230,7 @@
         (fn []
           (is (= 200 (:status (http/request :get forge {:connect-to (to s) :ssl-context (forge-trust)}))))))
       (is (= 1 (count @ports)))
-      (is (thrown? java.io.IOException (Socket. "127.0.0.1" (int (first @ports))))))))
+      (is (not (listening? (first @ports)))))))
 
 ;; Secrets
 
