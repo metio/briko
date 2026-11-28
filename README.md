@@ -124,7 +124,7 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (paths/load-edn-config path {:keep 3} {:empty :defaults :dangling :missing})
 ```
 
-- `briko.fs` writes files safely. `atomic-write!` stages the content in a uniquely named file beside the target, forces it to disk and renames it into place, so a reader sees the old content or the new and two writers never mix; it refuses rather than falls back when the file system cannot rename atomically. `write-private!` and `create-private-directory!` create a file `rw-------` or a directory `rwx------` in the same call that creates it, refuse whatever already exists at the path, a symbolic link included, and refuse a file system that cannot keep the permissions.
+- `briko.fs` writes files safely. `atomic-write!` stages the content in a uniquely named file beside the target, forces it to disk and renames it into place, so a reader sees the old content or the new and two writers never mix; it refuses rather than falls back when the file system cannot rename atomically. `:mode` gives the staged file exact permissions (`"rwxr-xr-x"`, or `:keep` for those of the file it replaces) before the rename, so the path never shows the umask's mode; `:symlink :follow` writes the file a symbolic link at the path ends at, within 40 links and optionally inside a `:root`, instead of replacing the link. `replace-symlink!` repoints a symbolic link in one rename, so readers never find the path missing, and refuses a directory and, unless asked, a regular file. `staged?` recognises the names both stage under. `write-private!` and `create-private-directory!` create a file `rw-------` or a directory `rwx------` in the same call that creates it, refuse whatever already exists at the path, a symbolic link included, and refuse a file system that cannot keep the permissions.
 
 ```clojure
 (require '[briko.fs :as bfs])
@@ -132,6 +132,9 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (bfs/atomic-write! "state/inventory.edn" (pr-str inventory))
 (bfs/atomic-write! "cache/index" bytes {:fsync? false})
 (bfs/write-private! (str dir "/token") token)
+(bfs/atomic-write! "bin/run" script {:mode "rwxr-xr-x"})
+(bfs/atomic-write! "~/.config/app/session" text {:symlink :follow :root home})
+(bfs/replace-symlink! "store/app/current" "1.2.3")
 ```
 
 - `briko.digest` computes SHA-256 and SHA-512 of bytes, text (UTF-8), streams and files, the last two in bounded memory, and prints digests as lowercase hex without a prefix; a format that writes `sha256-` or `sha256:` adds its own. `checksum-hex`, `checksum-hex-stream` and `checksum-hex-file` take `:md5`, `:sha1`, `:sha256` or `:sha512` for comparing a download with the checksum its publisher printed; MD5 and SHA-1 are offered only there.
