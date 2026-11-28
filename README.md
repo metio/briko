@@ -26,7 +26,7 @@ Every namespace runs under babashka, on the JVM and in a GraalVM native image:
 
 - it uses only classes babashka exposes;
 - it compiles without reflection warnings, because a reflective call fails at run time in a native image;
-- it depends on nothing beyond Clojure, [babashka.fs](https://github.com/babashka/fs) and [babashka.process](https://github.com/babashka/process). babashka carries both built in; on the JVM they arrive through briko's `deps.edn`. The JSON functions of `briko.mcp` resolve [cheshire](https://github.com/dakrone/cheshire) when first called: babashka carries it, a JVM consumer declares it, and a native image requires `cheshire.core` where it is built.
+- it depends on nothing beyond Clojure, [babashka.fs](https://github.com/babashka/fs) and [babashka.process](https://github.com/babashka/process). babashka carries both built in; on the JVM they arrive through briko's `deps.edn`. `briko.json` and the JSON functions of `briko.mcp` resolve [cheshire](https://github.com/dakrone/cheshire) when first called: babashka carries it, a JVM consumer declares it, and a native image requires `cheshire.core` (and `cheshire.factory` for `briko.json`) where it is built.
 
 A function that cannot do its job cleanly throws an `ex-info` whose data carries a stable `:type` keyword, so callers can branch on the failure without parsing messages.
 
@@ -39,6 +39,15 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 
 (edn/read-file ".tool.edn" {:max-bytes 65536 :expect map?})
 (edn/read-string text {:readers {'inst #(java.time.Instant/parse %)}})
+```
+
+- `briko.json` reads JSON from text that may come from anywhere, strictly: RFC 8259 only (no comments, NaN, trailing commas or raw control characters), within a byte limit, valid UTF-8 only, at most 64 levels deep, with number literals of at most 100 characters and no decimal that overflows a double, no object that names a key twice, and exactly one value. Keys stay strings unless the caller asks for keywords, for every key or only for a set of names. `write-string` prints JSON with every control, format, separator, lone-surrogate, unassigned and default-ignorable code point written as `\uXXXX`, so nothing invisible or terminal-controlling reaches a reader raw while readable text such as `Größe` stays as it is, and refuses a map whose keys print to the same name. No refusal carries the input; a position is given as `:line` and `:column`.
+
+```clojure
+(require '[briko.json :as json])
+
+(json/parse-string "{\"items\":[1,2]}" {:keys #{"items"} :max-bytes 65536})  ;; => {:items [1 2]}
+(json/write-string {:name "evil\u202e"})                                        ;; => "{\"name\":\"evil\\u202E\"}"
 ```
 
 - `briko.process` runs a program as an argv, never through a shell, within a deadline (60 s by default) and with stdout and stderr captured up to a byte limit (1 MiB and 64 KiB). It never throws for a program that cannot be started (exit 127) or that overruns its deadline (exit 124, after its process tree was killed). Its output travels through named pipes, so `mkfifo` must be on the PATH; a run that finds none answers 127.
