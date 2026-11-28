@@ -138,6 +138,16 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (str "sha256-" (digest/sha256-hex-file "archive.tar.gz"))
 ```
 
+- `briko.inventory` reads and writes the repository inventory aro writes and krei reads: one EDN map from source id to records, sources sorted by id and records by path, one record per line, below a header of comment lines that survives a rewrite. Reading goes through `briko.edn` within 8 MiB, with no tagged literal, and refuses a record whose keys or values do not fit `record-keys`, or a source that lists one repository twice. `write!` replaces the file through `briko.fs/atomic-write!` only when its text changed; `default-path` is `aro/inventory.edn` in the XDG state home.
+
+```clojure
+(require '[briko.inventory :as inventory])
+
+(def inv (inventory/read-file (inventory/default-path) {:missing :empty}))
+(inventory/id (first (get-in inv [:sources "metio"])))   ;; => "github.com:metio/aro"
+(inventory/write! (inventory/default-path) (assoc-in inv [:sources "metio"] records))  ;; => true when changed
+```
+
 ## Cryptography
 
 briko implements no cryptographic primitive. Hashes and signature checks are the JDK's (`java.security`: SHA-256, SHA-512, Ed25519), and signing is OpenSSH's (`ssh-keygen`), so briko never reads a private key. What briko implements itself is the parsing of the SSHSIG wire format and of allowed-signers lines, and the assembly of the bytes a signature covers. Its tests check those verdicts against `ssh-keygen` on signatures `ssh-keygen` made.

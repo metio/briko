@@ -10,4 +10,5 @@
            briko.ssh-sign-test/with-temp-dir clojure.core/fn
            briko.paths-test/with-temp-dir clojure.core/fn
            briko.fs-test/with-temp-dir clojure.core/fn
-           briko.digest-test/with-temp-dir clojure.core/fn}}
+           briko.digest-test/with-temp-dir clojure.core/fn
+           briko.inventory-test/with-temp-dir clojure.core/fn}}
