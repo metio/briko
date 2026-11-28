@@ -110,9 +110,27 @@
 
 ;; cheshire
 
-(defn- cheshire-fn [sym] (requiring-resolve sym))
+(def ^:private require-lock (Object.))
 
-(defn- factory-var ^clojure.lang.Var [] (requiring-resolve 'cheshire.factory/*json-factory*))
+(defn- loaded-var
+  "The var `sym` names, its namespace loaded first. requiring-resolve
+   alone is not enough: cheshire's data_readers.clj maps cheshire/json to
+   cheshire.core/generate-string, so Clojure interns that var, unbound,
+   when it starts, and requiring-resolve returns it without loading
+   cheshire.core. A plain require would not load it either under
+   babashka, which takes an existing namespace as loaded."
+  ^clojure.lang.Var [sym]
+  (let [v (requiring-resolve sym)]
+    (if (bound? v)
+      v
+      (locking require-lock
+        (when-not (bound? v)
+          (require (symbol (namespace sym)) :reload))
+        v))))
+
+(defn- cheshire-fn [sym] (loaded-var sym))
+
+(defn- factory-var ^clojure.lang.Var [] (loaded-var 'cheshire.factory/*json-factory*))
 
 ;; Options
 

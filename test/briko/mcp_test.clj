@@ -146,14 +146,93 @@
     (is (= [[{"text" "m"} :modern] [{"text" "l"} :legacy]] @calls))))
 
 (deftest unreadable-input-answers-a-parse-error-and-the-session-goes-on
-  (doseq [text ["not json" "not json at all {{{" "" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"} trailing"
-                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}" nil]]
+  (doseq [[text rule] [["not json" "malformed"]
+                       ["not json at all {{{" "malformed"]
+                       ["" "no-value"]
+                       ["   " "no-value"]
+                       ["{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"} trailing" "trailing-value"]
+                       ["{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}" "trailing-value"]
+                       [nil "invalid-input"]]]
     (let [{:keys [response status]} (line server text nil)]
       (is (= 200 status) (pr-str text))
-      (is (= {"jsonrpc" "2.0" "id" nil "error" {"code" -32700 "message" "parse error: not a JSON value"}} response)
-          (pr-str text))))
+      (is (= -32700 (get-in response ["error" "code"])) (pr-str text))
+      (is (nil? (get response "id")) (pr-str text))
+      (is (str/starts-with? (get-in response ["error" "message"]) "parse error: ") (pr-str text))
+      (is (= rule (get-in response ["error" "data" "rule"])) (pr-str text))))
   (testing "negative control: one value with trailing whitespace is read"
     (is (= {} (get-in (line "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}  \n") [:response "result"])))))
+
+(defn- ping-with
+  "A ping request whose params hold `params-json` verbatim."
+  [params-json]
+  (str "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\",\"params\":" params-json "}"))
+
+(defn- nested [depth] (str (str/join (repeat depth "[")) (str/join (repeat depth "]"))))
+
+(deftest a-message-breaking-a-json-rule-answers-a-parse-error-naming-it
+  (doseq [[label text rule] [["a key named twice" (ping-with "{\"a\":1,\"a\":2}") "duplicate-key"]
+                             ["a key named twice at the top" "{\"jsonrpc\":\"2.0\",\"id\":7,\"id\":8,\"method\":\"ping\"}" "duplicate-key"]
+                             ["65 levels" (ping-with (str "{\"x\":" (nested 63) "}")) "too-deep"]
+                             ["a 101-character number" (ping-with (str "{\"x\":" (str/join (repeat 101 "1")) "}")) "number-too-long"]
+                             ["a number beyond a double" (ping-with "{\"x\":1e400}") "number-out-of-range"]
+                             ["a raw control character in a string" (ping-with (str "{\"x\":\"a" (char 1) "b\"}")) "malformed"]
+                             ["a comment" (ping-with "{/* c */}") "malformed"]]]
+    (let [{:keys [response status]} (line server text nil)]
+      (is (= 200 status) label)
+      (is (= -32700 (get-in response ["error" "code"])) label)
+      (is (= rule (get-in response ["error" "data" "rule"])) label)))
+  (testing "negative controls: the same messages within the rules are answered"
+    (doseq [[label text] [["distinct keys" (ping-with "{\"a\":1,\"b\":2}")]
+                          ["64 levels" (ping-with (str "{\"x\":" (nested 62) "}"))]
+                          ["a 100-character number" (ping-with (str "{\"x\":" (str/join (repeat 100 "1")) "}"))]
+                          ["a large double" (ping-with "{\"x\":1e300}")]
+                          ["an escaped control character" (ping-with "{\"x\":\"a\\u0001b\"}")]]]
+      (is (= {"jsonrpc" "2.0" "id" 7 "result" {}} (:response (line server text nil))) label))))
+
+(deftest a-parse-error-quotes-no-part-of-the-message
+  (let [marker (str "sec" "ret-" (random-uuid))
+        texts [(str "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"" marker "\",}")
+               (str "{\"" marker "\":1,\"" marker "\":2}")
+               (str "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"} " marker)
+               (str "{\"x\":\"" marker (char 1) "\"}")]]
+    (doseq [text texts]
+      (is (str/includes? text marker) "positive control: the input holds the marker")
+      (let [out (mcp/write-response (:response (mcp/handle-line server text)))]
+        (is (str/includes? out "-32700"))
+        (is (not (str/includes? out marker)) text)))))
+
+(deftest max-message-bytes-bounds-a-message-in-utf-8-bytes
+  (let [base (ping-with "{\"x\":\"\"}")
+        padded (fn [n c] (ping-with (str "{\"x\":\"" (str/join (repeat n c)) "\"}")))
+        limit (+ (count base) 10)]
+    (testing "exactly the limit is read"
+      (is (= {} (get-in (mcp/handle-line server (padded 10 "a") {:max-message-bytes limit}) [:response :result]))))
+    (testing "one byte over is refused"
+      (let [r (:response (mcp/handle-line server (padded 11 "a") {:max-message-bytes limit}))]
+        (is (= -32700 (get-in r [:error :code])))
+        (is (= "too-large" (get-in r [:error :data :rule])))))
+    (testing "the bound counts bytes: 10 characters of two bytes each are 20"
+      (is (= "too-large" (get-in (mcp/handle-line server (padded 10 "\u00e4") {:max-message-bytes limit})
+                                 [:response :error :data :rule])))
+      (is (= {} (get-in (mcp/handle-line server (padded 5 "\u00e4") {:max-message-bytes limit}) [:response :result]))
+          "negative control: 5 of them fit"))
+    (testing "the default is 16 MiB"
+      (is (= 16777216 (:max-message-bytes mcp/defaults)))
+      (is (= {} (get-in (mcp/handle-line server (padded 2000000 "a")) [:response :result]))
+          "a 2 MB message is above briko.json's own 1 MiB default and is read"))))
+
+(deftest invalid-options-are-refused
+  (doseq [opts [{:max-message-bytes 0} {:max-message-bytes -1} {:max-message-bytes "16"}
+                {:max-message-bytes Integer/MAX_VALUE} {:max-message-bytes 1.5} {:max-bytes 10} [:headers]]]
+    (doseq [[label f] [["handle-line" #(mcp/handle-line server "{}" opts)]
+                       ["read-json" #(mcp/read-json "{}" opts)]
+                       ["serve-stdio" #(with-in-str "" (mcp/serve-stdio server opts))]]]
+      (let [e (try (f) nil (catch clojure.lang.ExceptionInfo e e))]
+        (is (= ::mcp/invalid-arguments (:type (ex-data e))) (str label " " (pr-str opts))))))
+  (testing "negative control: valid options are taken"
+    (is (map? (mcp/handle-line server "{}" {:max-message-bytes 100 :headers nil})))
+    (is (= {} (mcp/read-json "{}" {:max-message-bytes 2})))
+    (is (= "" (with-out-str (with-in-str "" (mcp/serve-stdio server {:max-message-bytes 2})))))))
 
 (deftest a-value-that-is-no-request-is-an-invalid-request
   (doseq [text ["[1,2,3]" "5" "null" "\"a bare string\"" "{\"id\":1,\"method\":\"ping\"}"
@@ -308,7 +387,24 @@
   (is (= ::mcp/unreadable (mcp/read-json "{\"a\":1} 2")))
   (is (= ::mcp/unreadable (mcp/read-json "")))
   (is (= ::mcp/unreadable (mcp/read-json 42)))
+  (is (= ::mcp/unreadable (mcp/read-json "{\"a\":1,\"a\":2}")))
+  (is (= ::mcp/unreadable (mcp/read-json "[1,2]" {:max-message-bytes 4})))
+  (is (= [1 2] (mcp/read-json "[1,2]" {:max-message-bytes 5})))
   (is (= "{\"a\":1}" (mcp/write-json {:a 1}))))
+
+(deftest write-response-escapes-hidden-code-points-and-refuses-colliding-keys
+  (let [rlo (str (char 0x202E))]
+    (is (= "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"t\":\"a\\u202Eb\"}}"
+           (mcp/write-response {:jsonrpc "2.0" :id 1 :result {:t (str "a" rlo "b")}})))
+    (is (= "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"t\":\"Gr\u00f6\u00dfe\"}}"
+           (mcp/write-response {:jsonrpc "2.0" :id 1 :result {:t "Gr\u00f6\u00dfe"}}))
+        "negative control: readable non-ASCII stays as it is"))
+  (let [out (json/parse-string (mcp/write-response {:jsonrpc "2.0" :id "x" :result {:a 1 "a" 2}}))]
+    (is (= {"code" -32603 "data" {"rule" "duplicate-key"}} (dissoc (get out "error") "message")))
+    (is (= "x" (get out "id"))))
+  (testing "write-json leaves the refusal to the caller"
+    (is (= :briko.json/duplicate-key
+           (:type (ex-data (try (mcp/write-json {:a 1 "a" 2}) (catch clojure.lang.ExceptionInfo e e))))))))
 
 (deftest stdio-answers-one-line-per-request
   (let [in (str "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n"
@@ -320,3 +416,106 @@
     (is (= [1 nil 99] (mapv #(get % "id") lines)) "the notification wrote nothing")
     (is (= -32700 (get-in lines [1 "error" "code"])))
     (is (= "echo" (get-in lines [2 "result" "tools" 0 "name"])))))
+
+(defn- stdio
+  "The answers serve-stdio writes for input `in`, parsed, under `opts`."
+  [in opts]
+  (let [out (with-out-str (with-in-str in (mcp/serve-stdio server opts)))]
+    (if (= "" out) [] (mapv json/parse-string (str/split-lines out)))))
+
+(defn- ping-line [id] (str "{\"jsonrpc\":\"2.0\",\"id\":" id ",\"method\":\"ping\"}"))
+
+(deftest stdio-refuses-a-line-over-the-bound-and-reads-the-next
+  (let [limit 100
+        long-line (ping-with (str "{\"x\":\"" (str/join (repeat 200 "a")) "\"}"))
+        answers (stdio (str (ping-line 1) "\n" long-line "\n" (ping-line 3) "\n") {:max-message-bytes limit})]
+    (is (= [1 nil 3] (mapv #(get % "id") answers)))
+    (is (= {"code" -32700 "message" "parse error: the input is larger than 100 bytes" "data" {"rule" "too-large"}}
+           (get (second answers) "error")))
+    (is (= {} (get (nth answers 2) "result"))))
+  (testing "a line over the bound longer than the read buffer"
+    (let [answers (stdio (str (str/join (repeat 50000 "x")) "\n" (ping-line 2) "\n") {:max-message-bytes 1000})]
+      (is (= [nil 2] (mapv #(get % "id") answers)))
+      (is (= "too-large" (get-in answers [0 "error" "data" "rule"])))))
+  (testing "a last line over the bound without a newline"
+    (is (= ["too-large"] (mapv #(get-in % ["error" "data" "rule"])
+                               (stdio (str/join (repeat 300 "x")) {:max-message-bytes 100})))))
+  (testing "the bound counts bytes on stdio too"
+    (let [two-byte (ping-with (str "{\"x\":\"" (str/join (repeat 40 "\u00e4")) "\"}"))]
+      (is (< (count two-byte) 100 (count (.getBytes ^String two-byte "UTF-8"))) "positive control: chars fit, bytes do not")
+      (is (= "too-large" (get-in (stdio (str two-byte "\n") {:max-message-bytes 100}) [0 "error" "data" "rule"])))))
+  (testing "negative control: the same line under a larger bound is answered"
+    (let [long-line (ping-with (str "{\"x\":\"" (str/join (repeat 200 "a")) "\"}"))]
+      (is (= {} (get-in (stdio (str long-line "\n") {:max-message-bytes 1000}) [0 "result"]))))))
+
+(deftest stdio-reads-crlf-and-a-last-line-without-newline
+  (is (= [1 2] (mapv #(get % "id") (stdio (str (ping-line 1) "\r\n" (ping-line 2)) nil))))
+  (testing "a line of exactly the bound before a carriage return is read"
+    (let [l (ping-line 1)]
+      (is (= [1] (mapv #(get % "id") (stdio (str l "\r\n") {:max-message-bytes (count l)}))))))
+  (testing "an empty line answers -32700 and an empty input nothing"
+    (is (= ["no-value"] (mapv #(get-in % ["error" "data" "rule"]) (stdio "\n" nil))))
+    (is (= [] (stdio "" nil)))))
+
+(defn- endless-line
+  "An InputStream of n bytes of x, a newline and then `tail`, generated
+   as it is read rather than held."
+  ^java.io.InputStream [^long n ^String tail]
+  (let [pos (volatile! 0)
+        tail-bytes (.getBytes tail "UTF-8")
+        total (+ n 1 (alength tail-bytes))
+        byte-at (fn [^long i] (cond (< i n) 120 (= i n) 10 :else (aget tail-bytes (- i n 1))))]
+    (proxy [java.io.InputStream] []
+      (available [] 0)
+      (read
+        ([] (let [i (long @pos)] (if (< i total) (do (vswap! pos inc) (byte-at i)) -1)))
+        ([b] (.read ^java.io.InputStream this b 0 (alength ^bytes b)))
+        ([b off len]
+         (let [i (long @pos)]
+           (if (>= i total)
+             -1
+             (let [k (min (long len) (- total i))]
+               (dotimes [j k] (aset-byte b (+ (long off) j) (byte (byte-at (+ i j)))))
+               (vreset! pos (+ i k))
+               k))))))))
+
+(deftest stdio-drops-an-over-long-line-as-it-reads
+  (let [run (fn [n limit]
+              (let [out (java.io.StringWriter.)]
+                (binding [*in* (java.io.BufferedReader. (java.io.InputStreamReader. ^java.io.InputStream (endless-line n (str (ping-line 9) "\n")) "UTF-8"))
+                          *out* out]
+                  (mcp/serve-stdio server {:max-message-bytes limit}))
+                (mapv json/parse-string (str/split-lines (str out)))))]
+    (let [answers (run 2000000 1024)]
+      (is (= [nil 9] (mapv #(get % "id") answers)))
+      (is (= "too-large" (get-in answers [0 "error" "data" "rule"]))))
+    (testing "negative control: under a bound above the line it is parsed, and refused as no JSON"
+      (is (= "malformed" (get-in (run 2000000 4000000) [0 "error" "data" "rule"]))))))
+
+(deftest stdio-answers-a-line-before-the-next-arrives
+  (let [released (promise)
+        first-line (.getBytes (str (ping-line 1) "\n") "UTF-8")
+        sent (volatile! false)
+        in (proxy [java.io.InputStream] []
+             (available [] 0)
+             (read
+               ([] (throw (UnsupportedOperationException.)))
+               ([b] (.read ^java.io.InputStream this b 0 (alength ^bytes b)))
+               ([b off len]
+                (if-not @sent
+                  (do (System/arraycopy first-line 0 b off (alength first-line))
+                      (vreset! sent true)
+                      (alength first-line))
+                  (do (deref released 10000 nil) -1)))))
+        out (java.io.StringWriter.)
+        done (binding [*in* (java.io.BufferedReader. (java.io.InputStreamReader. in "UTF-8"))
+                       *out* out]
+               (future (mcp/serve-stdio server)))
+        deadline (+ (System/currentTimeMillis) 10000)]
+    (try
+      (while (and (not (str/includes? (str out) "\"id\":1")) (< (System/currentTimeMillis) deadline))
+        (Thread/sleep 10))
+      (is (str/includes? (str out) "\"id\":1") "the answer was written while the input stayed open")
+      (finally
+        (deliver released true)
+        (deref done 10000 nil)))))
