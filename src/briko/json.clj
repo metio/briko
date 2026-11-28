@@ -36,7 +36,10 @@
    point (see `hidden?`) as \\uXXXX, so text that reaches a terminal or
    an agent carries no control, bidirectional or zero-width character
    raw, while readable non-ASCII text such as Größe stays as it is. It
-   refuses a map whose keys print to the same name.
+   refuses a map whose keys print to the same name. Pretty output takes
+   the caller's indentation, array layout and key separator, so a format
+   fixed to cheshire's bytes can move here; :escape-hidden? false leaves
+   hidden code points raw for a format that fixes those bytes too.
 
    Every refusal is an ex-info whose data carries a stable :type, one of
    `refusal-types`. No refusal carries the input or a piece of it: a
@@ -82,13 +85,42 @@
   "The options a write uses where the caller gives none.
 
    - :pretty?, whether to indent the output: false.
+   - :indent, the spaces of one indentation level, from 0 to
+     `max-indent`: none, which indents pretty output by 2. Giving it
+     makes the output pretty; together with :pretty? false it is refused.
+   - :indent-arrays?, whether pretty output puts every array element on
+     a line of its own: false, which keeps the elements on the line of
+     the bracket as cheshire's default printer does.
+   - :key-separator, what pretty output writes between a key and its
+     value, one of `key-separators`: \" : \".
+   - :escape-hidden?, whether hidden code points (see `hidden?`) are
+     written as \\uXXXX: true. With false the code points stay raw as
+     cheshire writes them, for output whose bytes a format fixes, such
+     as an RFC 7638 thumbprint; such text must not reach a terminal or
+     an agent unescaped.
    - :allow-duplicate-keys?, whether a map may hold keys that print to the
      same name, such as :a and \"a\": false.
    - :max-depth, the deepest nesting of maps and collections: 256, well
-     within the stack cheshire's recursive printer needs."
+     within the stack cheshire's recursive printer needs.
+
+   :indent-arrays? and :key-separator shape pretty output only, and a
+   write that gives either without :pretty? true or :indent is refused.
+   Pretty output breaks lines with \\n on every platform."
   {:pretty? false
+   :indent nil
+   :indent-arrays? false
+   :key-separator " : "
+   :escape-hidden? true
    :allow-duplicate-keys? false
    :max-depth 256})
+
+(def max-indent
+  "The widest indentation level a write accepts, in spaces."
+  16)
+
+(def key-separators
+  "The texts pretty output may write between a key and its value."
+  #{":" ": " " : "})
 
 (def refusal-types
   "Every :type a refusal carries."
@@ -154,7 +186,12 @@
    :allow-duplicate-keys? [boolean? "a boolean"]
    :one-value? [boolean? "a boolean"]
    :expect [(fn [p] (or (nil? p) (ifn? p))) "nil or a predicate"]
-   :pretty? [boolean? "a boolean"]})
+   :pretty? [boolean? "a boolean"]
+   :indent [(fn [n] (or (nil? n) (and (int? n) (<= 0 (long n) (long max-indent)))))
+            (str "nil or an int from 0 to " max-indent)]
+   :indent-arrays? [boolean? "a boolean"]
+   :key-separator [key-separators (str "one of " (pr-str (sort key-separators)))]
+   :escape-hidden? [boolean? "a boolean"]})
 
 (defn- options
   [opts known]
@@ -666,26 +703,48 @@
           (refuse! ::duplicate-key "a map holds two keys that print to the same JSON name"))
         (recur (into [] (comp (mapcat children) (filter nested?)) level) (inc depth))))))
 
+(defn- printer-options
+  "The pretty-printer options cheshire takes for opts, or nil for compact
+   output. Refuses :indent beside :pretty? false, and a pretty-only option
+   in given for compact output."
+  [given {:keys [pretty? indent indent-arrays? key-separator]}]
+  (when (and (some? indent) (contains? given :pretty?) (not pretty?))
+    (refuse! ::invalid-options ":indent makes the output pretty, so :pretty? false contradicts it"
+             {:option :indent}))
+  (if (or pretty? (some? indent))
+    {:indentation (long (or indent 2))
+     :indent-arrays? indent-arrays?
+     :object-field-value-separator key-separator
+     :line-break "\n"}
+    (when-let [k (first (filter (partial contains? given) [:indent-arrays? :key-separator]))]
+      (refuse! ::invalid-options (str k " shapes pretty output only; give :pretty? true or :indent")
+               {:option k}))))
+
 (defn write-string
   "x as JSON text, printed by cheshire with every hidden code point
-   escaped (see `escape-hidden`), within the options of `write-defaults`.
-   Refuses a value nested deeper than :max-depth, a value cheshire cannot
-   encode and, unless allowed, a map whose keys print to the same name."
+   escaped (see `escape-hidden`) unless :escape-hidden? false, compact or
+   pretty within the options of `write-defaults`. Pretty output with the
+   same indentation, array layout and key separator is byte-identical to
+   cheshire's `generate-string` with those `create-pretty-printer`
+   options. Refuses a value nested deeper than :max-depth, a value
+   cheshire cannot encode and, unless allowed, a map whose keys print to
+   the same name."
   ([x] (write-string x nil))
   ([x opts]
-   (let [{:keys [pretty? allow-duplicate-keys? max-depth]} (options opts write-defaults)]
+   (let [{:keys [allow-duplicate-keys? max-depth escape-hidden?] :as all} (options opts write-defaults)
+         printer (printer-options opts all)]
      (check-value! x max-depth allow-duplicate-keys?)
-     (escape-hidden
-      (with-bindings {(factory-var) ((cheshire-fn 'cheshire.factory/make-json-factory) {})}
-        (try
-          ((cheshire-fn 'cheshire.core/generate-string) x {:pretty pretty?})
-          (catch StackOverflowError e
-            ;; A nesting the walk does not see, such as Java arrays.
-            (refuse! ::too-deep "the value nests too deep to print" {} e))
-          (catch Exception e
-            ;; cheshire's message prints the value it could not encode.
-            (let [class-name (.getName (class e))]
-              (if (and (str/ends-with? class-name "StreamConstraintsException")
-                       (str/includes? (str (ex-message e)) "nesting depth"))
-                (refuse! ::too-deep "the value nests deeper than the JSON writer allows")
-                (refuse! ::not-encodable "the value holds something JSON cannot encode"))))))))))
+     (cond-> (with-bindings {(factory-var) ((cheshire-fn 'cheshire.factory/make-json-factory) {})}
+               (try
+                 ((cheshire-fn 'cheshire.core/generate-string) x (if printer {:pretty printer} {}))
+                 (catch StackOverflowError e
+                   ;; A nesting the walk does not see, such as Java arrays.
+                   (refuse! ::too-deep "the value nests too deep to print" {} e))
+                 (catch Exception e
+                   ;; cheshire's message prints the value it could not encode.
+                   (let [class-name (.getName (class e))]
+                     (if (and (str/ends-with? class-name "StreamConstraintsException")
+                              (str/includes? (str (ex-message e)) "nesting depth"))
+                       (refuse! ::too-deep "the value nests deeper than the JSON writer allows")
+                       (refuse! ::not-encodable "the value holds something JSON cannot encode"))))))
+       escape-hidden? escape-hidden))))
