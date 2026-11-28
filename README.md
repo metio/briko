@@ -96,7 +96,7 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
   (when response (mcp/write-json response)))
 ```
 
-- `briko.skill-manifest` encodes, signs and verifies the `skill-manifest-v1` manifest of an agent skill served through the MCP Skills extension. A manifest names one skill, lists its SKILL.md, and holds only `skill://` URIs without `.` or `..` segments. The signature namespace and the size limits are arguments of every call.
+- `briko.skill-manifest` encodes, signs and verifies the `skill-manifest-v1` manifest of an agent skill served through the MCP Skills extension. A manifest names one skill, lists its SKILL.md, and holds only `skill://` URIs without `.` or `..` segments. The signature namespace and the size limits are arguments of every call. A `:malformed` verdict carries a stable `:code` from `malformed-codes` beside its human-readable `:reason`, so a caller branches on the code.
 
 ```clojure
 (require '[briko.skill-manifest :as sm])
@@ -106,6 +106,9 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (sm/verify allowed-signers-text (assoc entry :_meta {sm/meta-key marker})
            {:namespaces #{"demo-skill-manifest"} :limits limits})
 ;; => {:verdict :verified :actor "alice" :namespace "demo-skill-manifest"}
+(sm/verify allowed-signers-text (assoc-in entry [:_meta sm/meta-key "format"] "v2")
+           {:namespaces #{"demo-skill-manifest"} :limits limits})
+;; => {:verdict :malformed :code :unknown-format :reason "unknown manifest format \"v2\""}
 ```
 
 - `briko.paths` names where a program keeps its files: the XDG base directories, ignoring a variable that is empty, blank or relative as the specification asks; the home directory (`$HOME` when absolute, else the `user.home` property, else a refusal); `expand-home` for `~` and `~/…`; and `load-edn-config`, which reads one map through `briko.edn` and merges it over defaults. An empty or comment-only file and a dangling symbolic link are refused unless the caller opts in with `:empty :defaults` or `:dangling :missing`.
