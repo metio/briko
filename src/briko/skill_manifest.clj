@@ -134,9 +134,52 @@
 
 (def ^:private digest-re #"sha256:[0-9a-f]{64}")
 
-(defn problem
+(def malformed-codes
+  "Every :code a :malformed verdict of `verify`, the ::malformed refusal
+   of `canonical-bytes` and `explain` carry. A code names the rule the
+   entry broke and stays the same across releases; the :reason string
+   beside it is for people and may change.
+
+     :not-an-entry           the entry is not a map
+     :meta-twice             _meta is given by keyword and by string
+     :value-twice            the manifest value is given by keyword and
+                             by string
+     :value-not-an-object    the manifest value is not a map
+     :field-twice            a field of the manifest value is given by
+                             keyword and by string
+     :unknown-format         the format is not skill-manifest-v1
+     :signed-not-boolean     signed is neither true nor false
+     :no-actor-or-signature  a signed value lacks its actor or signature
+     :bad-skill-uri          the entry uri is not skill://<name>/<path>
+     :skill-uri-not-skill-file  the entry uri does not name SKILL.md
+     :no-resources           resources is not a list
+     :no-files               resources is empty
+     :resource-not-an-object a resource is not a map
+     :bad-resource-uri       a resource uri is not skill://<name>/<path>
+     :foreign-resource       a resource belongs to another skill
+     :bad-digest             a resource has no sha256: digest
+     :bad-size               a resource has no non-negative integer size
+     :file-too-large         a resource exceeds :max-file-bytes
+     :duplicate-file         a resource uri repeats
+     :skill-file-unlisted    the entry uri is not among the resources
+     :too-many-files         the skill exceeds :max-files
+     :skill-too-large        the skill exceeds :max-skill-bytes
+
+   The first eight concern the `_meta` value and come only from
+   `verify`; the rest concern the entry and come from all three."
+  #{:not-an-entry :meta-twice :value-twice :value-not-an-object :field-twice
+    :unknown-format :signed-not-boolean :no-actor-or-signature
+    :bad-skill-uri :skill-uri-not-skill-file :no-resources :no-files
+    :resource-not-an-object :bad-resource-uri :foreign-resource :bad-digest
+    :bad-size :file-too-large :duplicate-file :skill-file-unlisted
+    :too-many-files :skill-too-large})
+
+(defn- bad [code reason] {:code code :reason reason})
+
+(defn explain
   "Why the entry (keyword or string keys) cannot be signed or verified
-   under `limits`, as a string, or nil when it can."
+   under `limits`, as `{:code c :reason r}` with c one of
+   `malformed-codes`, or nil when it can."
   [entry limits]
   (check-limits! limits)
   (let [uri (when (map? entry) (field entry :uri))
@@ -146,36 +189,45 @@
                 (mapv #(if (map? %) {:uri (field % :uri) :digest (field % :digest) :size (field % :size)} %)
                       resources))]
     (cond
-      (not (map? entry)) "not a skill entry"
-      (nil? skill) (str "the skill URI " (pr-str uri) " is not skill://<name>/<path>")
-      (not= skill-file path) (str "the skill URI " uri " does not name the skill's " skill-file)
-      (not (sequential? resources)) "the entry has no list of resources"
-      (empty? files) "the entry lists no files"
-      (not (every? map? files)) "a resource is not an object"
+      (not (map? entry)) (bad :not-an-entry "not a skill entry")
+      (nil? skill) (bad :bad-skill-uri (str "the skill URI " (pr-str uri) " is not skill://<name>/<path>"))
+      (not= skill-file path) (bad :skill-uri-not-skill-file (str "the skill URI " uri " does not name the skill's " skill-file))
+      (not (sequential? resources)) (bad :no-resources "the entry has no list of resources")
+      (empty? files) (bad :no-files "the entry lists no files")
+      (not (every? map? files)) (bad :resource-not-an-object "a resource is not an object")
       :else
       (or (some (fn [{u :uri d :digest s :size}]
                   (cond
-                    (nil? (parse-uri u)) (str "the resource URI " (pr-str u) " is not skill://<name>/<path>")
-                    (not= skill (first (parse-uri u))) (str "the resource " u " belongs to another skill")
-                    (not (and (string? d) (re-matches digest-re d))) (str "the resource " u " has no sha256 digest")
-                    (not (and (integer? s) (<= 0 s))) (str "the resource " u " has no size")
+                    (nil? (parse-uri u))
+                    (bad :bad-resource-uri (str "the resource URI " (pr-str u) " is not skill://<name>/<path>"))
+                    (not= skill (first (parse-uri u))) (bad :foreign-resource (str "the resource " u " belongs to another skill"))
+                    (not (and (string? d) (re-matches digest-re d))) (bad :bad-digest (str "the resource " u " has no sha256 digest"))
+                    (not (and (integer? s) (<= 0 s))) (bad :bad-size (str "the resource " u " has no size"))
                     (< (:max-file-bytes limits) s)
-                    (str "the resource " u " exceeds " (:max-file-bytes limits) " bytes")))
+                    (bad :file-too-large (str "the resource " u " exceeds " (:max-file-bytes limits) " bytes"))))
                 files)
           (cond
-            (not (apply distinct? (map :uri files))) "the manifest names a file twice"
-            (not-any? #(= uri (:uri %)) files) (str "the manifest does not list " uri)
+            (not (apply distinct? (map :uri files))) (bad :duplicate-file "the manifest names a file twice")
+            (not-any? #(= uri (:uri %)) files) (bad :skill-file-unlisted (str "the manifest does not list " uri))
             (< (long (:max-files limits)) (count files))
-            (str "the skill exceeds " (:max-files limits) " files")
+            (bad :too-many-files (str "the skill exceeds " (:max-files limits) " files"))
             (< (:max-skill-bytes limits) (reduce + (map :size files)))
-            (str "the skill exceeds " (:max-skill-bytes limits) " bytes"))))))
+            (bad :skill-too-large (str "the skill exceeds " (:max-skill-bytes limits) " bytes")))))))
+
+(defn problem
+  "Why the entry (keyword or string keys) cannot be signed or verified
+   under `limits`, as a string, or nil when it can. `explain` gives the
+   stable code as well."
+  [entry limits]
+  (:reason (explain entry limits)))
 
 (defn canonical-bytes
   "The bytes a manifest signature covers. Throws an ex-info with :type
-   ::malformed and the :reason when `problem` refuses the entry."
+   ::malformed, the :code and the :reason when `explain` refuses the
+   entry."
   ^bytes [entry limits]
-  (when-let [reason (problem entry limits)]
-    (throw (ex-info (str "the skill manifest cannot be encoded: " reason) {:type ::malformed :reason reason})))
+  (when-let [{:keys [code reason]} (explain entry limits)]
+    (throw (ex-info (str "the skill manifest cannot be encoded: " reason) {:type ::malformed :code code :reason reason})))
   (let [files (for [r (field entry :resources)]
                 {:uri (field r :uri) :digest (field r :digest) :size (field r :size)})]
     (.getBytes (str "skill-manifest v1\n"
@@ -212,6 +264,8 @@
 
 ;; Verifying
 
+(defn- malformed [code reason] {:verdict :malformed :code code :reason reason})
+
 (defn verify
   "The verdict on the manifest signature of `entry` (keyword or string
    keys) under the allowed-signers text `allowed-signers`. `opts`:
@@ -221,7 +275,9 @@
 
      {:verdict :verified :actor a :namespace ns}
      {:verdict :missing}                  no manifest value in _meta
-     {:verdict :malformed :reason r}      the manifest or the value cannot be read
+     {:verdict :malformed :code c :reason r}
+                                          the manifest or the value cannot be
+                                          read; c is one of `malformed-codes`
      {:verdict :unsigned :reason r}       the server says it holds no signature
      {:verdict :wrong-namespace :namespace ns}
      {:verdict :bad-signature :actor a}   the signature does not verify for its actor
@@ -236,23 +292,23 @@
   (run! check-namespace! namespaces)
   (check-limits! limits)
   (let [m (when (map? entry) (meta-of entry))
-        reason (problem entry limits)
+        entry-problem (explain entry limits)
         marker (when (map? m) (into {} (map (fn [k] [k (field m k)])) [:format :signed :namespace :actor :signature :reason]))
         {fmt :format signed :signed namespace :namespace actor :actor signature :signature} marker]
     (cond
-      (not (map? entry)) {:verdict :malformed :reason "not a skill entry"}
-      (= ::ambiguous (field entry :_meta)) {:verdict :malformed :reason "_meta is given twice"}
-      (= ::ambiguous m) {:verdict :malformed :reason "the manifest value is given twice"}
+      (not (map? entry)) (malformed :not-an-entry "not a skill entry")
+      (= ::ambiguous (field entry :_meta)) (malformed :meta-twice "_meta is given twice")
+      (= ::ambiguous m) (malformed :value-twice "the manifest value is given twice")
       (nil? m) {:verdict :missing}
-      (not (map? m)) {:verdict :malformed :reason "the manifest value is not an object"}
-      (some #{::ambiguous} (vals marker)) {:verdict :malformed :reason "the manifest value gives a field twice"}
-      (not= manifest-format fmt) {:verdict :malformed :reason (str "unknown manifest format " (pr-str fmt))}
-      reason {:verdict :malformed :reason reason}
+      (not (map? m)) (malformed :value-not-an-object "the manifest value is not an object")
+      (some #{::ambiguous} (vals marker)) (malformed :field-twice "the manifest value gives a field twice")
+      (not= manifest-format fmt) (malformed :unknown-format (str "unknown manifest format " (pr-str fmt)))
+      entry-problem (assoc entry-problem :verdict :malformed)
       (false? signed) {:verdict :unsigned :reason (str (:reason marker))}
-      (not (true? signed)) {:verdict :malformed :reason "signed is neither true nor false"}
+      (not (true? signed)) (malformed :signed-not-boolean "signed is neither true nor false")
       (not (contains? namespaces namespace)) {:verdict :wrong-namespace :namespace namespace}
       (not (and (string? actor) (not (str/blank? actor)) (string? signature)))
-      {:verdict :malformed :reason "a signed value needs an actor and a signature"}
+      (malformed :no-actor-or-signature "a signed value needs an actor and a signature")
       :else
       (let [ok (ssh-sign/verify-text allowed-signers (canonical-bytes entry limits)
                                      (.getBytes ^String signature StandardCharsets/UTF_8)

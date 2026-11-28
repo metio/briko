@@ -164,11 +164,98 @@
                    ["uri and :uri both" (assoc entry :uri "skill://demo/SKILL.md")]
                    ["not a map" [entry]]]]
     (is (string? (sm/problem e tik-limits)) why)
+    (is (contains? sm/malformed-codes (:code (sm/explain e tik-limits))) why)
     (is (= ::sm/malformed (try (sm/canonical-bytes e tik-limits) nil
                                (catch clojure.lang.ExceptionInfo x (:type (ex-data x)))))
         why))
   (testing "negative control: the well-formed entry is accepted"
-    (is (nil? (sm/problem entry tik-limits)))))
+    (is (nil? (sm/problem entry tik-limits)))
+    (is (nil? (sm/explain entry tik-limits)))))
+
+;; Malformed codes
+
+(def ^:private code-limits {:max-files 2 :max-file-bytes 10 :max-skill-bytes 15})
+
+(def ^:private unsigned-marker (sm/unsigned "no key"))
+
+(defn- with-marker [e m] (assoc e "_meta" {sm/meta-key m}))
+
+(def ^:private signed-marker
+  {"format" sm/manifest-format "signed" true "namespace" "demo-skill-manifest"
+   "actor" "alice" "signature" "-----BEGIN SSH SIGNATURE-----"})
+
+(def ^:private meta-cases
+  "A minimal bad manifest for each code about the _meta value, over a
+   well-formed entry."
+  {:not-an-entry "not an entry"
+   :meta-twice (assoc (with-marker entry unsigned-marker) :_meta {sm/meta-key unsigned-marker})
+   :value-twice (assoc entry "_meta" {sm/meta-key unsigned-marker (keyword sm/meta-key) unsigned-marker})
+   :value-not-an-object (with-marker entry "signed")
+   :field-twice (with-marker entry (assoc unsigned-marker :format sm/manifest-format))
+   :unknown-format (with-marker entry (assoc unsigned-marker "format" "skill-manifest-v2"))
+   :signed-not-boolean (with-marker entry (assoc signed-marker "signed" "true"))
+   :no-actor-or-signature (with-marker entry (dissoc signed-marker "actor"))})
+
+(def ^:private entry-cases
+  "A minimal bad entry for each code about the entry itself, under
+   code-limits."
+  (let [files #(assoc entry "resources" (vec %&))]
+    {:bad-skill-uri (assoc entry "uri" "skill://Demo/SKILL.md")
+     :skill-uri-not-skill-file (assoc entry "uri" "skill://demo/a.md")
+     :no-resources (assoc entry "resources" "dynamic")
+     :no-files (files)
+     :resource-not-an-object (files f-md "x")
+     :bad-resource-uri (files f-md (assoc f-a "uri" "skill://demo/../x.md"))
+     :foreign-resource (files f-md (assoc f-a "uri" "skill://other/a.md"))
+     :bad-digest (files (assoc f-md "digest" "sha256:ab"))
+     :bad-size (files (assoc f-md "size" -1))
+     :file-too-large (files (assoc f-md "size" 11))
+     :duplicate-file (files f-md f-md)
+     :skill-file-unlisted (files f-a)
+     :too-many-files (files f-md f-a (assoc f-a "uri" "skill://demo/b.md"))
+     :skill-too-large (files (assoc f-md "size" 10) (assoc f-a "size" 6))}))
+
+(deftest every-malformed-code-has-a-case-and-every-case-a-code
+  (is (= sm/malformed-codes (into (set (keys meta-cases)) (keys entry-cases))))
+  (is (every? simple-keyword? sm/malformed-codes)))
+
+(deftest each-meta-code-comes-from-a-minimal-bad-manifest
+  (doseq [[code e] meta-cases]
+    (testing code
+      (let [v (sm/verify "" e {:namespaces #{"demo-skill-manifest"} :limits code-limits :ssh-sign no-ssh-keygen})]
+        (is (= :malformed (:verdict v)))
+        (is (= code (:code v)))
+        (is (and (string? (:reason v)) (not (str/blank? (:reason v)))) "the reason string stays")))))
+
+(deftest each-entry-code-comes-from-a-minimal-bad-entry-in-every-api
+  (doseq [[code e] entry-cases]
+    (testing code
+      (let [{c :code r :reason} (sm/explain e code-limits)
+            v (sm/verify "" (with-marker e unsigned-marker)
+                         {:namespaces #{"demo-skill-manifest"} :limits code-limits :ssh-sign no-ssh-keygen})
+            data (try (sm/canonical-bytes e code-limits) nil (catch clojure.lang.ExceptionInfo x (ex-data x)))]
+        (is (= code c) "explain")
+        (is (= r (sm/problem e code-limits)) "problem gives explain's reason")
+        (is (= {:verdict :malformed :code code :reason r} v) "verify")
+        (is (= {:type ::sm/malformed :code code :reason r} data) "canonical-bytes")))))
+
+(deftest negative-controls-for-the-malformed-codes
+  (testing "the entry under the cases is well formed under code-limits"
+    (is (nil? (sm/explain entry code-limits)))
+    (is (some? (sm/canonical-bytes entry code-limits))))
+  (testing "the markers under the meta cases pass the malformed checks untouched"
+    (is (= {:verdict :unsigned :reason "no key"}
+           (sm/verify "" (with-marker entry unsigned-marker)
+                      {:namespaces #{"demo-skill-manifest"} :limits code-limits :ssh-sign no-ssh-keygen})))
+    (is (not= :malformed
+              (:verdict (sm/verify "" (with-marker entry signed-marker)
+                                   {:namespaces #{"demo-skill-manifest"} :limits code-limits :ssh-sign no-ssh-keygen}))))
+    (is (= {:verdict :missing}
+           (sm/verify "" entry {:namespaces #{"demo-skill-manifest"} :limits code-limits :ssh-sign no-ssh-keygen}))))
+  (testing "verdicts other than :malformed carry no code"
+    (is (not (contains? (sm/verify "" (with-marker entry unsigned-marker)
+                                   {:namespaces #{"other-skill-manifest"} :limits code-limits})
+                        :code)))))
 
 (deftest the-limits-are-the-callers
   (let [limits {:max-files 2 :max-file-bytes 10 :max-skill-bytes 15}
