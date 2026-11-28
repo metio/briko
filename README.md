@@ -182,6 +182,18 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (inventory/write! (inventory/default-path) (assoc-in inv [:sources "metio"] records))  ;; => true when changed
 ```
 
+- `briko.http` makes one HTTP request on `java.net.http` and answers `{:status :headers :body :url}` within a connect deadline (10 s) and a total deadline (60 s) that also covers the body and every redirect, with the body read into memory up to a limit (16 MiB) and refused, never cut short, beyond it. It requires https except to `localhost`, 127.0.0.0/8 and `[::1]`, follows no redirect unless `:max-redirects` is positive, never follows one from https to http, and drops `Authorization`, `Proxy-Authorization` and `Cookie` when a redirect leaves the origin. Header names must be HTTP tokens and values free of control characters. Every status is an answer; a refusal names the URL without its query and never carries a header value or the body. `trust-context` builds an `SSLContext` trusting only the certificates given, for a private authority.
+
+```clojure
+(require '[briko.http :as http])
+
+(http/request :get "https://api.github.com/repos/metio/briko"
+              {:headers {"Authorization" (str "Bearer " token)} :as :text :timeout-ms 20000})
+;; => {:status 200 :headers {"content-type" ["application/json; charset=utf-8"] ...} :body "{...}" :url "..."}
+(http/request :post "http://127.0.0.1:9090/api/v1/admin/tsdb/delete_series" {:query {"match[]" selector}})
+(http/request :get url {:max-redirects 3 :allow-redirect? allowed? :max-bytes 1048576})
+```
+
 ## Cryptography
 
 briko implements no cryptographic primitive. Hashes and signature checks are the JDK's (`java.security`: SHA-256, SHA-512, Ed25519), and signing is OpenSSH's (`ssh-keygen`), so briko never reads a private key. What briko implements itself is the parsing of the SSHSIG wire format and of allowed-signers lines, and the assembly of the bytes a signature covers. Its tests check those verdicts against `ssh-keygen` on signatures `ssh-keygen` made.
