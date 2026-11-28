@@ -1,0 +1,119 @@
+;; SPDX-FileCopyrightText: The briko Authors
+;; SPDX-License-Identifier: 0BSD
+
+;; Skill entries as tik and kajero put them on the wire, each signed by
+;; the project's own code with a throwaway ed25519 key whose private
+;; half was deleted: tik.skills/wire-entry at tik 4cf5f6a under bb, and
+;; kajero.skills/signer at kajero 866cde7 (tik.sign at 8447157) on the
+;; JVM. :canonical is each project's own canonical-bytes of the entry.
+;; The demo skill is the same file set in both.
+{:tik
+ {:allowed-signers
+  "tik-fixture namespaces=\"tik-*\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAaVejO8sQy5o0JjrfK02ImtyBmOMbuMFsy1+gHWdVLW\n",
+  :entries
+  [{:entry
+    {"uri" "skill://tik/SKILL.md",
+     "frontmatter"
+     {"name" "tik",
+      "description"
+      "Drive the tik CLI and author sound process definitions. Use when working in a repository that is a tik store (has a tickets/ or .tik/ directory, an actors file, or processes/*.edn), when the user mentions tik, tickets, processes, stages, or asks to record work / check what is next / design a workflow-as-evidence. Covers the CLI verbs and the one design law that separates good process definitions from task lists."},
+     "resources"
+     [{"uri" "skill://tik/SKILL.md",
+       "digest"
+       "sha256:02417d84e31478a33614938c735842ef18b591dbac2c4fc0e172c1507e898f9a",
+       "size" 39171}],
+     "_meta"
+     {"wtf.metio/skill-manifest"
+      {"format" "skill-manifest-v1",
+       "signed" true,
+       "namespace" "tik-skill-manifest",
+       "actor" "tik-fixture",
+       "signature"
+       "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgBpV6M7yxDLmjQmOt8rTYia3IGY\n4xu4wWzLX6AdZ1UtYAAAASdGlrLXNraWxsLW1hbmlmZXN0AAAAAAAAAAZzaGE1MTIAAABT\nAAAAC3NzaC1lZDI1NTE5AAAAQImwQCx+grce7UlyyOjKpA67Kf2gkvjr5mo6SiG6I0ywOM\nxNUYGnKdTp0kJmYoQ1lfec6NCFedcEgyZkrYYg5QI=\n-----END SSH SIGNATURE-----\n"}}},
+    :canonical
+    "skill-manifest v1\nskill skill://tik/SKILL.md\nfile sha256:02417d84e31478a33614938c735842ef18b591dbac2c4fc0e172c1507e898f9a 39171 skill://tik/SKILL.md\n"}
+   {:entry
+    {"uri" "skill://demo/SKILL.md",
+     "frontmatter" {"name" "demo", "description" "A demo skill."},
+     "resources"
+     [{"uri" "skill://demo/SKILL.md",
+       "digest"
+       "sha256:31969c6de60e2416868fbb0d212f01b5a1599e9eadc4a3e9c01090f1d7cc853f",
+       "size" 53}
+      {"uri" "skill://demo/Upper_case-1.edn",
+       "digest"
+       "sha256:8c145a8c32d5be55635edc38e9e5ae6a066a06156084381bbddf67cbd2a72290",
+       "size" 7}
+      {"uri" "skill://demo/references/a.md",
+       "digest"
+       "sha256:b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060",
+       "size" 6}
+      {"uri" "skill://demo/z.txt",
+       "digest"
+       "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "size" 0}],
+     "_meta"
+     {"wtf.metio/skill-manifest"
+      {"format" "skill-manifest-v1",
+       "signed" true,
+       "namespace" "tik-skill-manifest",
+       "actor" "tik-fixture",
+       "signature"
+       "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgBpV6M7yxDLmjQmOt8rTYia3IGY\n4xu4wWzLX6AdZ1UtYAAAASdGlrLXNraWxsLW1hbmlmZXN0AAAAAAAAAAZzaGE1MTIAAABT\nAAAAC3NzaC1lZDI1NTE5AAAAQMYtTi5SUghZPL+Z1K2YvBjRMj/1X6At9T2waR8acDEwlD\nBDI51Rxcv7x297kGNnaRITqELupDUvRlQ9mA0owQE=\n-----END SSH SIGNATURE-----\n"}}},
+    :canonical
+    "skill-manifest v1\nskill skill://demo/SKILL.md\nfile sha256:31969c6de60e2416868fbb0d212f01b5a1599e9eadc4a3e9c01090f1d7cc853f 53 skill://demo/SKILL.md\nfile sha256:8c145a8c32d5be55635edc38e9e5ae6a066a06156084381bbddf67cbd2a72290 7 skill://demo/Upper_case-1.edn\nfile sha256:b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060 6 skill://demo/references/a.md\nfile sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 skill://demo/z.txt\n"}]},
+ :kajero
+ {:allowed-signers
+  "kajero-fixture namespaces=\"kajero,kajero-skill-manifest\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAvdECLTKVu/rviULWYneCjygH3DIm0OUd7iRmnhSy2r\n",
+  :entries
+  [{:entry
+    {"uri" "skill://kajero/SKILL.md",
+     "frontmatter"
+     {"description"
+      "Read and write the team's kajero notebook - labelled entries of what agents and humans learned, with signed revisions and observations, structured data and tik tickets as evidence. Use when the user mentions kajero or the notebook, before investigating something another agent may already have worked out (a gotcha, a fact about a system, a how-to), after learning something worth keeping, when handing notes, data or a document to another agent or a later session, and whenever you checked an entry against reality and can say whether it held.",
+      "name" "kajero"},
+     "resources"
+     [{"uri" "skill://kajero/SKILL.md",
+       "digest"
+       "sha256:e027a3d5ab4ac396c03bcdbe0478f8a96b6666a24bba782980bb7f239efa9992",
+       "size" 18343}],
+     "_meta"
+     {"wtf.metio/skill-manifest"
+      {"format" "skill-manifest-v1",
+       "signed" true,
+       "namespace" "kajero-skill-manifest",
+       "actor" "kajero-fixture",
+       "signature"
+       "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgC90QItMpW7+u+JQtZid4KPKAfc\nMibQ5R3uJGaeFLLasAAAAVa2FqZXJvLXNraWxsLW1hbmlmZXN0AAAAAAAAAAZzaGE1MTIA\nAABTAAAAC3NzaC1lZDI1NTE5AAAAQPW4wtc/r20P9NKpY7mOTpl6NPe7179azXkhW6GhKU\nJ7vr64u5alahRA4gvJ2irjlC6jW8eMp9sWZ21bJlMyuwQ=\n-----END SSH SIGNATURE-----\n"}}},
+    :canonical
+    "skill-manifest v1\nskill skill://kajero/SKILL.md\nfile sha256:e027a3d5ab4ac396c03bcdbe0478f8a96b6666a24bba782980bb7f239efa9992 18343 skill://kajero/SKILL.md\n"}
+   {:entry
+    {"uri" "skill://demo/SKILL.md",
+     "frontmatter" {"description" "A demo skill.", "name" "demo"},
+     "resources"
+     [{"uri" "skill://demo/SKILL.md",
+       "digest"
+       "sha256:31969c6de60e2416868fbb0d212f01b5a1599e9eadc4a3e9c01090f1d7cc853f",
+       "size" 53}
+      {"uri" "skill://demo/Upper_case-1.edn",
+       "digest"
+       "sha256:8c145a8c32d5be55635edc38e9e5ae6a066a06156084381bbddf67cbd2a72290",
+       "size" 7}
+      {"uri" "skill://demo/references/a.md",
+       "digest"
+       "sha256:b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060",
+       "size" 6}
+      {"uri" "skill://demo/z.txt",
+       "digest"
+       "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+       "size" 0}],
+     "_meta"
+     {"wtf.metio/skill-manifest"
+      {"format" "skill-manifest-v1",
+       "signed" true,
+       "namespace" "kajero-skill-manifest",
+       "actor" "kajero-fixture",
+       "signature"
+       "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgC90QItMpW7+u+JQtZid4KPKAfc\nMibQ5R3uJGaeFLLasAAAAVa2FqZXJvLXNraWxsLW1hbmlmZXN0AAAAAAAAAAZzaGE1MTIA\nAABTAAAAC3NzaC1lZDI1NTE5AAAAQPMd5nqDCspojpkKnmJ1HARM9OBZCZVlJLjrMqVD+b\n39dA4wzOCET8MqwC0W6WiW7BW0Hp/zL99mhrXiPh/G6Q4=\n-----END SSH SIGNATURE-----\n"}}},
+    :canonical
+    "skill-manifest v1\nskill skill://demo/SKILL.md\nfile sha256:31969c6de60e2416868fbb0d212f01b5a1599e9eadc4a3e9c01090f1d7cc853f 53 skill://demo/SKILL.md\nfile sha256:8c145a8c32d5be55635edc38e9e5ae6a066a06156084381bbddf67cbd2a72290 7 skill://demo/Upper_case-1.edn\nfile sha256:b6a98d9ce9a2d9149288fa3df42d377c3e42737afdcdaf714e33c0a100b51060 6 skill://demo/references/a.md\nfile sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 skill://demo/z.txt\n"}]}}

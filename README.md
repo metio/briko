@@ -26,7 +26,7 @@ Every namespace runs under babashka, on the JVM and in a GraalVM native image:
 
 - it uses only classes babashka exposes;
 - it compiles without reflection warnings, because a reflective call fails at run time in a native image;
-- it depends on nothing beyond Clojure, [babashka.fs](https://github.com/babashka/fs) and [babashka.process](https://github.com/babashka/process). babashka carries both built in; on the JVM they arrive through briko's `deps.edn`.
+- it depends on nothing beyond Clojure, [babashka.fs](https://github.com/babashka/fs) and [babashka.process](https://github.com/babashka/process). babashka carries both built in; on the JVM they arrive through briko's `deps.edn`. The JSON functions of `briko.mcp` resolve [cheshire](https://github.com/dakrone/cheshire) when first called: babashka carries it, a JVM consumer declares it, and a native image requires `cheshire.core` where it is built.
 
 A function that cannot do its job cleanly throws an `ex-info` whose data carries a stable `:type` keyword, so callers can branch on the failure without parsing messages.
 
@@ -78,6 +78,34 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (def sig (ssh-sign/sign-bytes "/path/to/key" message-bytes "my-app-event"))
 (ssh-sign/verify-bytes "/path/to/allowed_signers" message-bytes sig "alice" "my-app-event")
 (ssh-sign/fingerprint (ssh-sign/pubkey "/path/to/key"))  ;; => "SHA256:..."
+```
+
+- `briko.mcp` handles the messages of a Model Context Protocol server, whatever carries them: the legacy `initialize` handshake and the modern revisions whose every request names its version and capabilities in `_meta`, the header check of modern Streamable HTTP requests, and request dispatch over handlers and a tool registry the caller supplies. A notification gets no response, and a failing handler answers with a JSON-RPC error instead of ending the session. `serve-stdio` answers over stdin and stdout; the HTTP server stays with the caller.
+
+```clojure
+(require '[briko.mcp :as mcp])
+
+(def server
+  (mcp/server {:server-info {:name "demo" :version "1"}
+               :capabilities {:tools {}}
+               :handlers (mcp/tool-handlers
+                          [{:name "echo" :description "Echoes text." :inputSchema {:type "object"}
+                            :call (fn [args _request] {:text (get args "text")})}])}))
+
+(let [{:keys [response status]} (mcp/handle-line server line {:headers lower-cased-headers})]
+  (when response (mcp/write-json response)))
+```
+
+- `briko.skill-manifest` encodes, signs and verifies the `skill-manifest-v1` manifest of an agent skill served through the MCP Skills extension. A manifest names one skill, lists its SKILL.md, and holds only `skill://` URIs without `.` or `..` segments. The signature namespace and the size limits are arguments of every call.
+
+```clojure
+(require '[briko.skill-manifest :as sm])
+
+(def limits {:max-files 512 :max-file-bytes 100000 :max-skill-bytes 400000})
+(def marker (sm/sign entry {:key-file "/path/to/key" :actor "alice" :namespace "demo-skill-manifest" :limits limits}))
+(sm/verify allowed-signers-text (assoc entry :_meta {sm/meta-key marker})
+           {:namespaces #{"demo-skill-manifest"} :limits limits})
+;; => {:verdict :verified :actor "alice" :namespace "demo-skill-manifest"}
 ```
 
 ## Cryptography
