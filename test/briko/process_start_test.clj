@@ -122,6 +122,31 @@
           (is (gone-within? pid 5000) (str "process " pid " survived the close")))
         (finally (run! kill! (conj pids (:pid h))))))))
 
+(defn- descendant-pids
+  "The pids of pid's descendants, as the JDK walks them."
+  [pid]
+  (let [^Optional h (java.lang.ProcessHandle/of (long pid))]
+    (if (.isPresent h)
+      (set (map (fn [^java.lang.ProcessHandle d] (.pid d))
+                (iterator-seq (.iterator (.descendants ^java.lang.ProcessHandle (.get h))))))
+      #{})))
+
+(deftest close-kills-a-descendant-detached-after-a-sample
+  ;; The child starts a grandchild holding none of the output and exits
+  ;; after the first samples, so only a sample can have seen it.
+  (with-temp-dir [dir]
+    (let [orphan (fs/path dir "orphan")
+          h (process/start ["sh" "-c" (str "sh -c 'sleep 300 </dev/null >/dev/null 2>&1 & echo $! > " orphan "; sleep 0.4' "
+                                           "</dev/null >/dev/null 2>&1; sleep 300")])
+          pid (read-pid orphan)]
+      (try
+        (is (within? (fn [] (not (contains? (descendant-pids (:pid h)) pid))) 5000)
+            "the grandchild left the program's tree before the close")
+        (is (pid-alive? pid) "negative control: the orphan runs before the close")
+        (is (= 137 (process/close h)))
+        (is (gone-within? pid 5000) (str "the orphan " pid " survived the close"))
+        (finally (run! kill! [pid (:pid h)]))))))
+
 (deftest close-kills-a-detached-holder-of-the-output
   (with-temp-dir [dir]
     (let [pid-file (fs/path dir "pid")

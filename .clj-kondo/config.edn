@@ -7,6 +7,7 @@
            ;; (with-temp-dir [dir] body) binds dir like a fn parameter
            briko.process-test/with-temp-dir clojure.core/fn
            briko.process-start-test/with-temp-dir clojure.core/fn
+           briko.mkfifo-test/with-temp-dir clojure.core/fn
            briko.secret-test/with-temp-dir clojure.core/fn
            briko.ssh-sign-test/with-temp-dir clojure.core/fn
            briko.paths-test/with-temp-dir clojure.core/fn

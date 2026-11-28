@@ -4,10 +4,15 @@
 (ns briko.process-bench
   "Measures what a short run costs through briko.process against
    babashka.process, and how much of it the named pipes take. Prints one
-   EDN map per case. Run it on both runtimes:
+   EDN map per case. Run it on both runtimes, and on the JVM also with
+   native access, under which the pipes are made through mkfifo(3):
 
      bb -cp src:dev -m briko.process-bench 300
-     clojure -M:dev -m briko.process-bench 300"
+     clojure -M:dev -m briko.process-bench 300
+     clojure -J--enable-native-access=ALL-UNNAMED -M:dev -m briko.process-bench 300
+
+   A second argument names a git repository; `git rev-parse HEAD` in it
+   is then measured too."
   (:require [babashka.fs :as fs]
             [babashka.process :as bp]
             [briko.process :as process]))
@@ -38,17 +43,26 @@
       (make-fifos! [(str dir "/out") (str dir "/err")] (+ (System/nanoTime) 60000000000))
       (finally (fs/delete-tree dir)))))
 
+(defn- shell
+  [& argv]
+  (apply bp/shell {:out :string :err :string :continue true} argv))
+
 (defn -main
-  [& [n]]
+  [& [n repo]]
   (let [n (or (some-> n parse-long) 300)
         runtime (if (System/getProperty "babashka.version") :bb :jvm)
-        cases [[:briko-git-version #(process/run ["git" "--version"])]
-               [:babashka-process-git-version #(bp/shell {:out :string :err :string :continue true} "git" "--version")]
-               [:briko-true #(process/run ["true"])]
-               [:babashka-process-true #(bp/shell {:out :string :err :string :continue true} "true")]
-               [:fifo-setup-only fifo-setup]]]
+        cases (cond-> [[:briko-git-version #(process/run ["git" "--version"])]
+                       [:babashka-process-git-version #(shell "git" "--version")]
+                       [:briko-true #(process/run ["true"])]
+                       [:babashka-process-true #(shell "true")]
+                       [:briko-sleep-12ms #(process/run ["sleep" "0.012"])]
+                       [:babashka-process-sleep-12ms #(shell "sleep" "0.012")]
+                       [:fifo-setup-only fifo-setup]]
+                repo (into [[:briko-git-rev-parse #(process/run ["git" "-C" repo "rev-parse" "HEAD"])]
+                            [:babashka-process-git-rev-parse #(shell "git" "-C" repo "rev-parse" "HEAD")]]))]
     (doseq [[case f] cases]
       (prn (merge {:runtime runtime :case case :runs n
+                   :native-access (boolean (some-> (resolve 'briko.process/native-mkfifo) deref deref))
                    :java (System/getProperty "java.version")
                    :babashka (System/getProperty "babashka.version")}
                   (ms-per-run n f))))
