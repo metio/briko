@@ -41,7 +41,7 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (edn/read-string text {:readers {'inst #(java.time.Instant/parse %)}})
 ```
 
-- `briko.process` runs a program as an argv, never through a shell, within a deadline (60 s by default) and with stdout and stderr captured up to a byte limit (1 MiB and 64 KiB). It never throws for a program that cannot be started (exit 127) or that overruns its deadline (exit 124, after its process tree was killed).
+- `briko.process` runs a program as an argv, never through a shell, within a deadline (60 s by default) and with stdout and stderr captured up to a byte limit (1 MiB and 64 KiB). It never throws for a program that cannot be started (exit 127) or that overruns its deadline (exit 124, after its process tree was killed). Its output travels through named pipes, so `mkfifo` must be on the PATH; a run that finds none answers 127.
 
 ```clojure
 (require '[briko.process :as process])
