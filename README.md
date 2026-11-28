@@ -187,6 +187,8 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 
 - `briko.http` makes one HTTP request on `java.net.http` and answers `{:status :headers :body :url}` within a connect deadline (10 s) and a total deadline (60 s) that also covers the body and every redirect, with the body read into memory up to a limit (16 MiB) and refused, never cut short, beyond it. It requires https except to `localhost`, 127.0.0.0/8 and `[::1]`, follows no redirect unless `:max-redirects` is positive, never follows one from https to http, and drops `Authorization`, `Proxy-Authorization` and `Cookie` when a redirect leaves the origin. Header names must be HTTP tokens and values free of control characters. Every status is an answer; a refusal names the URL without its query and never carries a header value or the body. `trust-context` builds an `SSLContext` trusting only the certificates given, for a private authority.
 
+`:as {:file path}` streams a 2xx body into a staged file beside `path` and renames it over `path` once it is complete, within `:max-bytes` (which may then exceed 2 GiB) and the deadline, forced to disk first; a body over the limit, past the deadline or cut off removes the staged file and leaves `path` untouched, and another status returns a nil `:body` without writing. A HEAD answer is not held to `:max-bytes` by its stated Content-Length. `:connect-to {:host :port}` sends an https request to another address, such as a forwarded port, through a loopback CONNECT tunnel that lives for the one request, while SNI, the Host header and certificate verification use the URL's host; a redirect leaving the origin is then refused.
+
 ```clojure
 (require '[briko.http :as http])
 
@@ -195,6 +197,10 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 ;; => {:status 200 :headers {"content-type" ["application/json; charset=utf-8"] ...} :body "{...}" :url "..."}
 (http/request :post "http://127.0.0.1:9090/api/v1/admin/tsdb/delete_series" {:query {"match[]" selector}})
 (http/request :get url {:max-redirects 3 :allow-redirect? allowed? :max-bytes 1048576})
+(http/request :get release-url {:as {:file "/tmp/tool.tar.gz" :on-progress (fn [n total] ...)}
+                                :max-bytes (* 4 1024 1024 1024) :max-redirects 5 :timeout-ms 600000})
+;; => {:status 200 :headers {...} :body "/tmp/tool.tar.gz" :url "..."}
+(http/request :get "https://github.com/api/v3/user" {:connect-to {:host "127.0.0.1" :port 8443}})
 ```
 
 ## Cryptography
