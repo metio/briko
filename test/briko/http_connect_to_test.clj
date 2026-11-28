@@ -219,6 +219,22 @@
     (.close server)
     (is (not (listening? port)))))
 
+(deftest a-closed-tunnel-accepts-no-connection
+  ;; The race between close and the accept thread shows in a small share of
+  ;; closes, so one close proves little; each round closes a tunnel whose
+  ;; accept thread is blocked in accept.
+  (let [listening (atom [])]
+    (dotimes [_ 200]
+      (let [tunnel (#'briko.http/start-tunnel! (URI. "https://forge.briko.test/") {:host "127.0.0.1" :port 1}
+                                               (+ (System/nanoTime) 5000000000) {:connect-timeout-ms 1000})
+            port (:port tunnel)]
+        (try
+          (Thread/sleep 2)
+          ((:close tunnel))
+          (when (listening? port) (swap! listening conj port))
+          (finally ((:close tunnel))))))
+    (is (empty? @listening))))
+
 (deftest the-tunnel-is-closed-when-the-request-returns
   (with-server [s (f/start! (ok-handler "x") {:tls? true :cert :forge})]
     (let [start @#'briko.http/start-tunnel!

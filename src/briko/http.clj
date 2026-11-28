@@ -1024,21 +1024,37 @@
   "Listens on a free loopback port for the CONNECT requests of one
    request to uri and joins them to connect-to. Returns {:port :failure
    :close}: :failure holds why the last dial failed, :close closes the
-   listener and every connection."
+   listener and every connection, and returns once nothing listens on
+   the port any more."
   [^URI uri connect-to deadline {:keys [connect-timeout-ms]}]
   (let [server (ServerSocket. 0 8 (InetAddress/getByName "127.0.0.1"))
         sockets (atom [server])
         failure (atom nil)
-        expected (authority uri)]
-    (future
-      (loop []
-        (when-let [^Socket s (try (.accept server) (catch Exception _ nil))]
-          (swap! sockets conj s)
-          (future (serve-tunnel! s expected connect-to deadline connect-timeout-ms failure sockets))
-          (recur))))
+        closed? (atom false)
+        expected (authority uri)
+        accepting (future
+                    (loop []
+                      (when-let [^Socket s (try (.accept server) (catch Exception _ nil))]
+                        (swap! sockets conj s)
+                        (when-not @closed?
+                          (future (serve-tunnel! s expected connect-to deadline connect-timeout-ms failure sockets))
+                          (recur)))))]
     {:port (.getLocalPort server)
      :failure failure
-     :close (fn [] (doseq [s @sockets] (close-quietly s)))}))
+     :close (fn []
+              (reset! closed? true)
+              (close-quietly server)
+              ;; The JDK releases a listening socket that another thread is
+              ;; blocked accepting on only once that thread has left accept,
+              ;; so until then the kernel still completes connections to the
+              ;; port and accept may hand one out. Waiting for the accept
+              ;; loop makes the port closed when :close returns, and closing
+              ;; the sockets afterwards includes any connection accepted in
+              ;; that window, which the loop no longer serves. The wait is
+              ;; bounded so that an accept that never returns cannot hold
+              ;; the request.
+              (deref accepting 1000 nil)
+              (doseq [s @sockets] (close-quietly s)))}))
 
 ;; Redirects
 
