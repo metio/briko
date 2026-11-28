@@ -108,7 +108,7 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 ;; => {:verdict :verified :actor "alice" :namespace "demo-skill-manifest"}
 ```
 
-- `briko.paths` names where a program keeps its files: the XDG base directories, ignoring a variable that is empty, blank or relative as the specification asks; the home directory (`$HOME` when absolute, else the `user.home` property, else a refusal); `expand-home` for `~` and `~/…`; and `load-edn-config`, which reads one map through `briko.edn` and merges it over defaults.
+- `briko.paths` names where a program keeps its files: the XDG base directories, ignoring a variable that is empty, blank or relative as the specification asks; the home directory (`$HOME` when absolute, else the `user.home` property, else a refusal); `expand-home` for `~` and `~/…`; and `load-edn-config`, which reads one map through `briko.edn` and merges it over defaults. An empty or comment-only file and a dangling symbolic link are refused unless the caller opts in with `:empty :defaults` or `:dangling :missing`.
 
 ```clojure
 (require '[briko.paths :as paths])
@@ -117,6 +117,8 @@ A function that cannot do its job cleanly throws an `ex-info` whose data carries
 (paths/load-edn-config (str (paths/config-home) "/tool/config.edn")
                        {:store "~/.local/share/tool" :keep 3}
                        {:home-paths [[:store]] :edn {:max-bytes 65536}})
+;; an empty file reads as the defaults only when asked for
+(paths/load-edn-config path {:keep 3} {:empty :defaults :dangling :missing})
 ```
 
 - `briko.fs` writes files safely. `atomic-write!` stages the content in a uniquely named file beside the target, forces it to disk and renames it into place, so a reader sees the old content or the new and two writers never mix; it refuses rather than falls back when the file system cannot rename atomically. `write-private!` and `create-private-directory!` create a file `rw-------` or a directory `rwx------` in the same call that creates it, refuse whatever already exists at the path, a symbolic link included, and refuse a file system that cannot keep the permissions.
