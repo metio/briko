@@ -8,7 +8,7 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.7"}
         babashka/fs {:mvn/version "0.5.34"}
         babashka/process {:mvn/version "0.6.25"}}
- ;; briko.mcp reads and writes JSON through cheshire, resolved when first
+ ;; briko.json and briko.mcp read and write JSON through cheshire, resolved when first
  ;; used: babashka carries it and the JVM consumers declare it, so briko
  ;; itself needs it only for its tests. The jackson-core pin keeps the
  ;; resolution above GHSA-r7wm-3cxj-wff9 (patched in 2.21.4), which
